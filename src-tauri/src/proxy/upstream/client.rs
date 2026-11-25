@@ -1466,6 +1466,30 @@ impl UpstreamClient {
         }
     }
 
+    /// Only wrap/sanitize `generateContent`, `streamGenerateContent`, and `countTokens`.
+    /// Setup/account/discovery RPCs (`loadCodeAssist`, `fetchAvailableModels`, `onboardUser`,
+    /// `fetchUserInfo`, `retrieveUserQuota`, etc.) must NOT be wrapped in `project`/`requestId`/`request`/`userAgent`.
+    pub(crate) fn prepare_v1_internal_json_envelope(method: &str, body: &mut Value) {
+        if matches!(method, "generateContent" | "streamGenerateContent") {
+            if let Some(inner) = body.get_mut("request") {
+                crate::proxy::mappers::common_utils::sanitize_gemini_payload_inline_data(inner);
+                crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
+                    inner,
+                );
+                crate::proxy::mappers::common_utils::ensure_gemini_payload_ends_with_user(inner);
+            } else {
+                crate::proxy::mappers::common_utils::sanitize_gemini_payload_inline_data(body);
+                crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
+                    body,
+                );
+                crate::proxy::mappers::common_utils::ensure_gemini_payload_ends_with_user(body);
+            }
+            crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(body);
+        } else if method == "countTokens" {
+            crate::proxy::pipeline::InboundThinkingPipeline::align_count_tokens_envelope(body);
+        }
+    }
+
     /// `call_v1_internal_with_headers` 的实际实现（已在外层完成请求级预算夹取）
     async fn call_v1_internal_with_headers_inner(
         &self,
@@ -1476,25 +1500,7 @@ impl UpstreamClient {
         extra_headers: std::collections::HashMap<String, String>,
         account_id: Option<&str>, // [NEW] Account ID
     ) -> Result<UpstreamCallResult, String> {
-        // [DEFENSE] 全局终极防御拦截：净化所有发往上游报文中的损坏/空 inlineData 以及触发 Google WAF 拦截的违规计费元数据，并最终统一对齐官方信封与前缀拓扑
-        if let Some(inner) = body.get_mut("request") {
-            crate::proxy::mappers::common_utils::sanitize_gemini_payload_inline_data(inner);
-            crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
-                inner,
-            );
-            crate::proxy::mappers::common_utils::ensure_gemini_payload_ends_with_user(inner);
-        } else {
-            crate::proxy::mappers::common_utils::sanitize_gemini_payload_inline_data(&mut body);
-            crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
-                &mut body,
-            );
-            crate::proxy::mappers::common_utils::ensure_gemini_payload_ends_with_user(&mut body);
-        }
-        if method == "countTokens" {
-            crate::proxy::pipeline::InboundThinkingPipeline::align_count_tokens_envelope(&mut body);
-        } else {
-            crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut body);
-        }
+        Self::prepare_v1_internal_json_envelope(method, &mut body);
 
         // [Pipeline First] 在**统一的转出报文**（Gemini Canonical IR）上估一次 token：
         // 四条协议适配器最终都汇聚到这里，因此估算口径天然一致，
@@ -2242,6 +2248,180 @@ impl UpstreamClient {
         Ok(json)
     }
 
+    /// Forward raw bytes to a `v1internal:{method}` endpoint 100% byte-identical
+    /// (preserving incoming `Content-Type` such as `application/json` or `application/x-protobuf`,
+    /// without JSON re-serialization or envelope mutation).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn call_v1_internal_raw_bytes(
+        &self,
+        method: &str,
+        access_token: &str,
+        raw_body: bytes::Bytes,
+        content_type: Option<&str>,
+        query_string: Option<&str>,
+        extra_headers: std::collections::HashMap<String, String>,
+        account_id: Option<&str>,
+    ) -> Result<UpstreamCallResult, String> {
+        let client = self.get_client(account_id).await;
+        let mut headers = header::HeaderMap::new();
+        let ct_str = content_type
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("application/json");
+        headers.insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_str(ct_str)
+                .unwrap_or_else(|_| header::HeaderValue::from_static("application/json")),
+        );
+
+        let mut auth_val = header::HeaderValue::from_str(&format!("Bearer {}", access_token))
+            .map_err(|e| e.to_string())?;
+        auth_val.set_sensitive(true);
+        headers.insert(header::AUTHORIZATION, auth_val);
+
+        headers.insert(
+            header::USER_AGENT,
+            header::HeaderValue::from_str(&self.get_user_agent().await).unwrap_or_else(|_| {
+                header::HeaderValue::from_str(
+                    crate::constants::current_egress_user_agent().as_str(),
+                )
+                .unwrap_or_else(|_| header::HeaderValue::from_static("antigravity"))
+            }),
+        );
+
+        for (k, v) in extra_headers {
+            let k_lower = k.to_ascii_lowercase();
+            if matches!(
+                k_lower.as_str(),
+                "host"
+                    | "content-length"
+                    | "content-type"
+                    | "authorization"
+                    | "connection"
+                    | "user-agent"
+            ) {
+                continue;
+            }
+            if let Ok(hk) = header::HeaderName::from_bytes(k.as_bytes()) {
+                if let Ok(hv) = header::HeaderValue::from_str(&v) {
+                    headers.insert(hk, hv);
+                }
+            }
+        }
+
+        let candidate_endpoints = self
+            .endpoint_health
+            .get_ordered_endpoints(&V1_INTERNAL_BASE_URL_FALLBACKS);
+        let mut fallback_attempts = Vec::new();
+        let mut last_err: Option<String> = None;
+
+        for (idx, base_url) in candidate_endpoints.iter().enumerate() {
+            let url = Self::build_url(base_url, method, query_string);
+            let has_next = idx + 1 < candidate_endpoints.len();
+            let attempt_start = std::time::Instant::now();
+
+            let send_res = tokio::time::timeout(
+                Duration::from_secs(30),
+                client
+                    .post(&url)
+                    .headers(headers.clone())
+                    .body(raw_body.to_vec())
+                    .send(),
+            )
+            .await;
+
+            match send_res {
+                Ok(Ok(resp)) => {
+                    let status = resp.status();
+                    let duration_s = attempt_start.elapsed().as_secs_f64();
+                    if status.is_success() {
+                        self.endpoint_health.mark_success(base_url);
+                        fallback_attempts.push(FallbackAttemptLog {
+                            endpoint_name: parse_endpoint_name(base_url).to_string(),
+                            endpoint_url: url,
+                            status: Some(status.as_u16()),
+                            duration_s,
+                            switch_delay_s: None,
+                            error: String::new(),
+                            is_effective: true,
+                        });
+                        return Ok(UpstreamCallResult {
+                            response: resp,
+                            fallback_attempts,
+                            effective_attempt_start: attempt_start,
+                        });
+                    }
+                    if has_next && Self::should_try_next_endpoint_for_url(status, base_url) {
+                        self.endpoint_health.mark_failure(base_url);
+                        let raw_err = resp.text().await.unwrap_or_default();
+                        let sanitized = sanitize_error_for_log(&raw_err);
+                        last_err = Some(format!("HTTP {}: {}", status, sanitized));
+                        fallback_attempts.push(FallbackAttemptLog {
+                            endpoint_name: parse_endpoint_name(base_url).to_string(),
+                            endpoint_url: url,
+                            status: Some(status.as_u16()),
+                            duration_s,
+                            switch_delay_s: None,
+                            error: sanitized,
+                            is_effective: false,
+                        });
+                        continue;
+                    }
+                    fallback_attempts.push(FallbackAttemptLog {
+                        endpoint_name: parse_endpoint_name(base_url).to_string(),
+                        endpoint_url: url,
+                        status: Some(status.as_u16()),
+                        duration_s,
+                        switch_delay_s: None,
+                        error: format!("HTTP {}", status),
+                        is_effective: false,
+                    });
+                    return Ok(UpstreamCallResult {
+                        response: resp,
+                        fallback_attempts,
+                        effective_attempt_start: attempt_start,
+                    });
+                }
+                Ok(Err(e)) => {
+                    self.endpoint_health.mark_failure(base_url);
+                    let msg = format!("HTTP request failed at {}: {}", base_url, e);
+                    last_err = Some(msg.clone());
+                    fallback_attempts.push(FallbackAttemptLog {
+                        endpoint_name: parse_endpoint_name(base_url).to_string(),
+                        endpoint_url: url,
+                        status: None,
+                        duration_s: attempt_start.elapsed().as_secs_f64(),
+                        switch_delay_s: None,
+                        error: msg,
+                        is_effective: false,
+                    });
+                    if !has_next {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    self.endpoint_health.mark_failure(base_url);
+                    let msg = format!("HTTP request timed out after 30s at {}", base_url);
+                    last_err = Some(msg.clone());
+                    fallback_attempts.push(FallbackAttemptLog {
+                        endpoint_name: parse_endpoint_name(base_url).to_string(),
+                        endpoint_url: url,
+                        status: None,
+                        duration_s: attempt_start.elapsed().as_secs_f64(),
+                        switch_delay_s: None,
+                        error: msg,
+                        is_effective: false,
+                    });
+                    if !has_next {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| "All v1internal endpoints failed".to_string()))
+    }
+
     /// 辅助型 v1internal 调用（非用户请求路径，例如后台上下文摘要）。
     ///
     /// 为什么需要它：这类调用点位于 mapper / 辅助函数里，历史上拿不到 `AppState.upstream`
@@ -2270,7 +2450,7 @@ impl UpstreamClient {
     ) -> Result<Value, String> {
         if method == "countTokens" {
             crate::proxy::pipeline::InboundThinkingPipeline::align_count_tokens_envelope(&mut body);
-        } else {
+        } else if matches!(method, "generateContent" | "streamGenerateContent") {
             crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut body);
         }
         let client = self.get_client(account_id).await;

@@ -1,5 +1,6 @@
 import { useTranslation } from 'react-i18next';
 import { Account, ActiveClientsStatus } from '../../types/account';
+import { AsarTelemetrySnapshot } from '../../services/asarService';
 import AccountCard from './AccountCard';
 
 interface AccountGridProps {
@@ -9,6 +10,7 @@ interface AccountGridProps {
     onToggleSelect: (id: string) => void;
     currentAccountId: string | null;
     activeClients?: ActiveClientsStatus;
+    asarTelemetry?: AsarTelemetrySnapshot | null;
     switchingAccountId: string | null;
     onSwitch: (accountId: string, targetIde?: string) => void;
     onRefresh: (accountId: string) => void;
@@ -23,7 +25,7 @@ interface AccountGridProps {
 }
 
 
-function AccountGrid({ accounts, selectedIds, refreshingIds, onToggleSelect, currentAccountId, activeClients, switchingAccountId, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice, onWarmup, onUpdateLabel, onViewError }: AccountGridProps) {
+function AccountGrid({ accounts, selectedIds, refreshingIds, onToggleSelect, currentAccountId, activeClients, asarTelemetry, switchingAccountId, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice, onWarmup, onUpdateLabel, onViewError }: AccountGridProps) {
     const { t } = useTranslation();
     if (accounts.length === 0) {
         return (
@@ -45,6 +47,7 @@ function AccountGrid({ accounts, selectedIds, refreshingIds, onToggleSelect, cur
                     onSelect={() => onToggleSelect(account.id)}
                     isCurrent={account.id === currentAccountId}
                     activeClients={activeClients}
+                    asarTelemetry={asarTelemetry}
                     isSwitching={account.id === switchingAccountId}
                     onSwitch={(targetIde?: string) => onSwitch(account.id, targetIde)}
                     onRefresh={() => onRefresh(account.id)}

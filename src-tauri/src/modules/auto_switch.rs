@@ -396,6 +396,16 @@ pub async fn check_and_auto_switch_classic(
         return Ok(None);
     }
 
+    // 3.1 ASAR Zero-Reload Bridge 激活时禁止杀死 language_server 子进程，由网关按请求无感轮换
+    if crate::modules::asar_patch::is_patched(None)
+        && crate::modules::asar_patch::is_heartbeat_active()
+    {
+        logger::log_info(
+            "[AutoSwitch] ASAR Zero-Reload Bridge is active; suppressing language_server kill.",
+        );
+        return Ok(None);
+    }
+
     // 4. 获取经典款当前生效的账号 ID
     let status = account::detect_active_clients_status()?;
     let Some(current_classic_id) = status.classic_account_id else {

@@ -1454,6 +1454,14 @@ pub struct ProxyConfig {
     /// - true: 开启。当账号 TTFT 显著异常时标记疑似限速，累计超标关入小黑屋并解绑会话。
     #[serde(default)]
     pub qos_auto_jail: bool,
+
+    /// ASAR Zero-Reload Bridge enabled
+    #[serde(default)]
+    pub asar_bridge_enabled: bool,
+
+    /// ASAR Zero-Reload Bridge port (default 8989)
+    #[serde(default = "default_asar_bridge_port")]
+    pub asar_bridge_port: u16,
 }
 
 /// Request log retention policy.
@@ -1624,8 +1632,14 @@ impl Default for ProxyConfig {
             image_thinking_mode: None,
             image_scheduler: ImageSchedulerConfig::default(),
             qos_auto_jail: false,
+            asar_bridge_enabled: false,
+            asar_bridge_port: default_asar_bridge_port(),
         }
     }
+}
+
+fn default_asar_bridge_port() -> u16 {
+    8989
 }
 
 fn default_request_timeout() -> u64 {

@@ -21,6 +21,7 @@ pub struct ProxyServiceState {
     pub instance: Arc<RwLock<Option<ProxyServiceInstance>>>,
     pub monitor: Arc<RwLock<Option<Arc<ProxyMonitor>>>>,
     pub admin_server: Arc<RwLock<Option<AdminServerInstance>>>, // [NEW] 常驻管理服务器
+    pub asar_bridge: Arc<RwLock<Option<crate::proxy::asar_bridge::AsarBridgeHandle>>>, // [NEW] ASAR Zero-Reload Bridge
     pub starting: Arc<AtomicBool>, // [NEW] 标识是否正在启动中，防止死锁
 }
 
@@ -57,6 +58,7 @@ impl ProxyServiceState {
             instance: Arc::new(RwLock::new(None)),
             monitor: Arc::new(RwLock::new(None)),
             admin_server: Arc::new(RwLock::new(None)),
+            asar_bridge: Arc::new(RwLock::new(None)),
             starting: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -108,6 +110,56 @@ impl ProxyServiceState {
             .into_iter()
             .map(|s| s.token_manager)
             .collect()
+    }
+}
+
+/// Ensure the dedicated ASAR Zero-Reload Bridge server is running on `127.0.0.1:{port}`.
+pub async fn ensure_asar_bridge_started(
+    port: u16,
+    state: &ProxyServiceState,
+) -> Result<crate::proxy::asar_bridge::AsarBridgeStatus, String> {
+    {
+        let guard = state.asar_bridge.read().await;
+        if let Some(handle) = guard.as_ref() {
+            if handle.port == port {
+                return Ok(crate::proxy::asar_bridge::AsarBridgeStatus {
+                    running: true,
+                    port,
+                    base_url: format!("http://127.0.0.1:{}", port),
+                });
+            }
+        }
+    }
+
+    stop_asar_bridge_internal(state).await;
+
+    let app_state = {
+        let admin_lock = state.admin_server.read().await;
+        let admin = admin_lock
+            .as_ref()
+            .ok_or_else(|| "Admin server is not initialized yet".to_string())?;
+        admin.axum_server.state.clone()
+    };
+
+    let handle = crate::proxy::asar_bridge::start_asar_bridge(port, app_state).await?;
+    let mut guard = state.asar_bridge.write().await;
+    *guard = Some(handle);
+
+    Ok(crate::proxy::asar_bridge::AsarBridgeStatus {
+        running: true,
+        port,
+        base_url: format!("http://127.0.0.1:{}", port),
+    })
+}
+
+/// Stop the ASAR Zero-Reload Bridge server if running.
+pub async fn stop_asar_bridge_internal(state: &ProxyServiceState) {
+    let handle = {
+        let mut guard = state.asar_bridge.write().await;
+        guard.take()
+    };
+    if let Some(h) = handle {
+        h.stop().await;
     }
 }
 

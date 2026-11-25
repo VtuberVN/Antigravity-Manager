@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useRef, useMemo, useCallback } from 'react';
+import { useLocation } from 'react-router-dom';
 import { listen } from '@tauri-apps/api/event';
 import ModalDialog from '../common/ModalDialog';
 import { useTranslation } from 'react-i18next';
@@ -422,19 +423,21 @@ const LogTable: React.FC<LogTableProps> = ({
                                             {/* Protocol Badge */}
                                             {log.protocol ? (
                                                 <span className={`px-1.5 py-0.2 rounded text-[10px] font-bold border tracking-tight ${
-                                                    protocolLower === 'openai'
-                                                        ? 'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/50 dark:text-emerald-300 dark:border-emerald-800/80'
-                                                        : protocolLower === 'anthropic'
-                                                            ? 'bg-amber-50 text-amber-800 border-amber-200 dark:bg-amber-950/50 dark:text-amber-300 dark:border-amber-800/80'
-                                                            : protocolLower === 'gemini'
-                                                                ? 'bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-950/50 dark:text-blue-300 dark:border-blue-800/80'
-                                                                : protocolLower === 'ban_probe'
-                                                                    ? 'bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/50 dark:text-rose-300 dark:border-rose-800/80'
-                                                                    : protocolLower === 'warmup'
-                                                                        ? 'bg-orange-50 text-orange-700 border-orange-200 dark:bg-orange-950/50 dark:text-orange-300 dark:border-orange-800/80'
-                                                                        : 'bg-gray-100 text-gray-700 border-gray-200 dark:bg-base-300 dark:text-gray-300 dark:border-base-200'
+                                                    protocolLower === 'v1internal'
+                                                        ? 'bg-emerald-50 text-emerald-700 border-emerald-300 dark:bg-emerald-950/60 dark:text-emerald-300 dark:border-emerald-700/80'
+                                                        : protocolLower === 'openai'
+                                                            ? 'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/50 dark:text-emerald-300 dark:border-emerald-800/80'
+                                                            : protocolLower === 'anthropic'
+                                                                ? 'bg-amber-50 text-amber-800 border-amber-200 dark:bg-amber-950/50 dark:text-amber-300 dark:border-amber-800/80'
+                                                                : protocolLower === 'gemini'
+                                                                    ? 'bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-950/50 dark:text-blue-300 dark:border-blue-800/80'
+                                                                    : protocolLower === 'ban_probe'
+                                                                        ? 'bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/50 dark:text-rose-300 dark:border-rose-800/80'
+                                                                        : protocolLower === 'warmup'
+                                                                            ? 'bg-orange-50 text-orange-700 border-orange-200 dark:bg-orange-950/50 dark:text-orange-300 dark:border-orange-800/80'
+                                                                            : 'bg-gray-100 text-gray-700 border-gray-200 dark:bg-base-300 dark:text-gray-300 dark:border-base-200'
                                                 }`}>
-                                                    {protocolLower === 'openai' ? 'OpenAI' : protocolLower === 'anthropic' ? 'Claude' : protocolLower === 'gemini' ? 'Gemini' : protocolLower === 'ban_probe' ? t('monitor.protocols.ban_probe', 'Ban Probe') : protocolLower === 'warmup' ? t('monitor.protocols.warmup', 'Warmup') : log.protocol}
+                                                    {protocolLower === 'v1internal' ? '⚡ ASAR IDE' : protocolLower === 'openai' ? 'OpenAI' : protocolLower === 'anthropic' ? 'Claude' : protocolLower === 'gemini' ? 'Gemini' : protocolLower === 'ban_probe' ? t('monitor.protocols.ban_probe', 'Ban Probe') : protocolLower === 'warmup' ? t('monitor.protocols.warmup', 'Warmup') : log.protocol}
                                                 </span>
                                             ) : null}
                                         </div>
@@ -612,9 +615,20 @@ const LogTable: React.FC<LogTableProps> = ({
 
 export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     const { t } = useTranslation();
+    const location = useLocation();
     const [logs, setLogs] = useState<ProxyRequestLog[]>([]);
     const [stats, setStats] = useState<ProxyStats>({ total_requests: 0, success_count: 0, error_count: 0 });
-    const [filter, setFilter] = useState('');
+    const [filter, setFilter] = useState(() => {
+        const stateProtocol = (location.state as { protocol?: string } | null)?.protocol;
+        return stateProtocol || '';
+    });
+
+    useEffect(() => {
+        const stateProtocol = (location.state as { protocol?: string } | null)?.protocol;
+        if (stateProtocol) {
+            setFilter(stateProtocol);
+        }
+    }, [location.state]);
     const [accountFilter, setAccountFilter] = useState('');
     // [FIX] 使用 ref 存储最新的筛选条件，避免 setInterval 闭包问题
     const filterRef = useRef(filter);
@@ -975,6 +989,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
 
     const quickFilters = [
         { label: t('monitor.filters.all'), value: '' },
+        { label: t('monitor.filters.asar_ide', { defaultValue: '⚡ ASAR IDE' }), value: 'v1internal' },
         { label: 'claude', value: 'claude' },
         { label: 'flash', value: 'flash' },
         { label: 'pro', value: 'pro' },

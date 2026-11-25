@@ -11,6 +11,28 @@ export function isValidationBlockActive(
 }
 
 /**
+ * 账号是否需要手机/账号验证（VALIDATION_REQUIRED / validation_blocked），排除永久封禁账号。
+ */
+export function isAccountNeedsVerification(account: Account): boolean {
+    if (account.banned) return false;
+    if (isValidationBlockActive(account)) return true;
+
+    const reasons = [
+        account.validation_blocked_reason,
+        account.proxy_disabled_reason,
+        account.quota?.forbidden_reason,
+    ];
+    return reasons.some((raw) => {
+        const lower = (raw ?? '').toLowerCase();
+        return (
+            lower.includes('validation_required') ||
+            lower.includes('verify your account') ||
+            lower.includes('validation_url')
+        );
+    });
+}
+
+/**
  * 账号是否处于异常状态。
  *
  * 统一账号列表筛选与仪表盘统计口径，避免两处各自实现导致计数漂移。

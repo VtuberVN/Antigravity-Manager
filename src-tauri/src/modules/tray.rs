@@ -149,8 +149,8 @@ pub fn handle_tray_click(app: &tauri::AppHandle, rect: Option<tauri::Rect>) {
             }
         };
 
-        const MINI_WIDTH: f64 = 360.0;
-        const MINI_HEIGHT: f64 = 360.0;
+        const MINI_WIDTH: f64 = 430.0;
+        const MINI_HEIGHT: f64 = 460.0;
 
         let monitor = window.current_monitor().ok().flatten();
         let (mon_x, mon_y, mon_w, mon_h, scale_factor) = if let Some(ref m) = monitor {

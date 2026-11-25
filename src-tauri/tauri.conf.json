@@ -27,8 +27,8 @@
         "label": "mini",
         "title": "Antigravity Mini",
         "url": "index.html?mini=1",
-        "width": 360,
-        "height": 360,
+        "width": 430,
+        "height": 460,
         "decorations": false,
         "resizable": false,
         "shadow": true,
@@ -70,10 +70,10 @@
   },
   "plugins": {
     "updater": {
-      "active": true,
+      "active": false,
       "endpoints": [
-        "https://github.com/lbjlaq/Antigravity-Manager/releases/latest/download/updater.json",
-        "https://github.com/lbjlaq/Antigravity-Manager/releases/download/preview/updater.json"
+        "https://github.com/VtuberVN/Antigravity-Manager/releases/latest/download/updater.json",
+        "https://github.com/VtuberVN/Antigravity-Manager/releases/download/preview/updater.json"
       ],
       "dialog": true,
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJFRjVDRjdCREE1Rjg2NkYKUldSdmhsL2FlOC8xdnJuTzBtaTRhZkk1VWJ1cW5QWGU3ZWEwU20yZHRlZStxMnRWcUIzc3FwT2IK"

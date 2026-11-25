@@ -1,9 +1,9 @@
-import { useEffect, useState, useMemo } from 'react';
+import { useEffect, useState, useMemo, useCallback } from 'react';
 import {
     Maximize2, RefreshCw, ShieldAlert, Tag, Users,
     Laptop, Code2, Terminal, Blocks, Mail, Gem, Diamond, Circle, HelpCircle,
     ArrowRight, Check, ChevronDown, Shuffle, Power, Feather, Copy, Pin, X,
-    Sparkles, Bot
+    Sparkles, Bot, Zap, RotateCcw
 } from 'lucide-react';
 import { Gemini } from '@lobehub/icons';
 import { useViewStore } from '../../stores/useViewStore';
@@ -13,7 +13,20 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { invoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
 import clsx from 'clsx';
-import { formatTimeRemaining } from '../../utils/format';
+import { formatCompactNumber, formatTimeRemaining } from '../../utils/format';
+import {
+    AsarBridgeStatus,
+    AsarStatus,
+    AsarTelemetrySnapshot,
+    getAsarBridgeStatus,
+    getAsarStatus,
+    getAsarTelemetry,
+    resetAsarSlots,
+    setAsarDualTrack,
+    startAsarBridge,
+    stopAsarBridge,
+    toggleAsarHeartbeat,
+} from '../../services/asarService';
 import {
     DashboardQuotaView,
     getGroupQuotaSummaries,
@@ -26,7 +39,7 @@ import { isArgonModel } from '../../utils/modelCategory';
 import { GroupQuotaCard } from '../accounts/GroupQuotaCard';
 import { useConfigStore } from '../../stores/useConfigStore';
 
-type MiniTab = 'classic' | 'ide' | 'agy' | 'acp' | 'pool';
+type MiniTab = 'classic' | 'ide' | 'asar' | 'agy' | 'acp' | 'pool';
 
 interface MiniQuotaRowProps {
     displayName: string;
@@ -132,14 +145,42 @@ export default function MiniView() {
     // 默认是不停留的（Popover 模式），只有用户显式点击图钉才保持常驻悬浮
     const [isPinned, setIsPinned] = useState(false);
 
-    // 默认定位到活跃客户端 Tab，优先 classic/ide/agy/acp，绝不落入 pool
+    // 默认定位到活跃客户端 Tab，优先 classic/ide/asar/agy/acp，绝不落入 pool
     const [activeTab, setActiveTab] = useState<MiniTab>(() => {
         const saved = localStorage.getItem('mini_view_tab');
-        if (saved === 'classic' || saved === 'ide' || saved === 'agy' || saved === 'acp') {
+        if (saved === 'classic' || saved === 'ide' || saved === 'asar' || saved === 'agy' || saved === 'acp') {
             return saved;
         }
         return 'classic';
     });
+
+    const [asarStatus, setAsarStatus] = useState<AsarStatus | null>(null);
+    const [bridgeStatus, setBridgeStatus] = useState<AsarBridgeStatus | null>(null);
+    const [asarTelemetry, setAsarTelemetry] = useState<AsarTelemetrySnapshot | null>(null);
+    const [asarBusy, setAsarBusy] = useState<string | null>(null);
+
+    const fetchAsarMiniState = useCallback(async () => {
+        if (!isTauri()) return;
+        try {
+            const [st, br, tel] = await Promise.all([
+                getAsarStatus().catch(() => null),
+                getAsarBridgeStatus().catch(() => null),
+                getAsarTelemetry().catch(() => null),
+            ]);
+            if (st) setAsarStatus(st);
+            if (br) setBridgeStatus(br);
+            if (tel) setAsarTelemetry(tel);
+        } catch {
+            // Ignore transient polling errors
+        }
+    }, []);
+
+    useEffect(() => {
+        if (!isTauri()) return;
+        fetchAsarMiniState();
+        const timer = setInterval(fetchAsarMiniState, 2500);
+        return () => clearInterval(timer);
+    }, [fetchAsarMiniState]);
 
     const [quotaView, setQuotaView] = useState<DashboardQuotaView>(() => {
         const saved = localStorage.getItem('dashboard_quota_view');
@@ -187,7 +228,7 @@ export default function MiniView() {
     };
 
     const displayedAccount = useMemo(() => {
-        if (activeTab === 'pool') return null;
+        if (activeTab === 'pool' || activeTab === 'asar') return null;
         const currentClientAccountId = getClientAccountId(activeTab);
         if (currentClientAccountId && accounts.length > 0) {
             const found = accounts.find((a) => a.id === currentClientAccountId);
@@ -238,7 +279,9 @@ export default function MiniView() {
         if (isRefreshing) return;
         setIsRefreshing(true);
         try {
-            if (activeTab === 'pool') {
+            if (activeTab === 'asar') {
+                await fetchAsarMiniState();
+            } else if (activeTab === 'pool') {
                 await refreshAllQuotas();
                 await fetchAccounts();
                 await fetchCurrentAccount();
@@ -250,6 +293,64 @@ export default function MiniView() {
             console.error('Refresh failed:', e);
         } finally {
             setTimeout(() => setIsRefreshing(false), 800);
+        }
+    };
+
+    const handleMiniToggleHeartbeat = async () => {
+        if (asarBusy) return;
+        setAsarBusy('hb');
+        try {
+            const next = !(asarStatus?.heartbeat_active ?? false);
+            const st = await toggleAsarHeartbeat(next, false);
+            setAsarStatus(st);
+        } catch (e) {
+            console.error('Failed to toggle ASAR heartbeat:', e);
+        } finally {
+            setAsarBusy(null);
+        }
+    };
+
+    const handleMiniToggleBridge = async () => {
+        if (asarBusy) return;
+        setAsarBusy('bridge');
+        try {
+            if (bridgeStatus?.running) {
+                await stopAsarBridge();
+            } else {
+                await startAsarBridge(asarStatus?.bridge_port || bridgeStatus?.port || 8989);
+            }
+            await fetchAsarMiniState();
+        } catch (e) {
+            console.error('Failed to toggle ASAR bridge:', e);
+        } finally {
+            setAsarBusy(null);
+        }
+    };
+
+    const handleMiniToggleDualTrack = async () => {
+        if (asarBusy) return;
+        setAsarBusy('dt');
+        try {
+            const next = !(asarTelemetry?.dual_track_enabled ?? true);
+            const snap = await setAsarDualTrack(next);
+            setAsarTelemetry(snap);
+        } catch (e) {
+            console.error('Failed to toggle Dual-Track:', e);
+        } finally {
+            setAsarBusy(null);
+        }
+    };
+
+    const handleMiniResetSlots = async () => {
+        if (asarBusy) return;
+        setAsarBusy('slots');
+        try {
+            const snap = await resetAsarSlots();
+            setAsarTelemetry(snap);
+        } catch (e) {
+            console.error('Failed to reset ASAR slots:', e);
+        } finally {
+            setAsarBusy(null);
         }
     };
 
@@ -359,7 +460,7 @@ export default function MiniView() {
     }, [availableAccounts, accounts]);
 
     const handleSwitchAccount = async (accountId: string) => {
-        if (isSwitching || activeTab === 'pool') return;
+        if (isSwitching || activeTab === 'pool' || activeTab === 'asar') return;
         setIsSwitching(true);
         setShowAccountList(false);
         try {
@@ -374,7 +475,7 @@ export default function MiniView() {
     };
 
     const handleQuickNextAccount = async () => {
-        if (isSwitching || activeTab === 'pool' || accounts.length <= 1) return;
+        if (isSwitching || activeTab === 'pool' || activeTab === 'asar' || accounts.length <= 1) return;
         const poolToUse = availableAccounts.length > 0 ? availableAccounts : activePool;
         if (poolToUse.length === 0) return;
         const currentId = displayedAccount?.id;
@@ -596,6 +697,13 @@ export default function MiniView() {
             activeDot: 'bg-sky-400',
         },
         {
+            key: 'asar' as const,
+            label: 'ASAR',
+            icon: Zap,
+            tooltip: 'ASAR Zero-Reload Bridge (127.0.0.1:8989)',
+            activeDot: 'bg-emerald-400',
+        },
+        {
             key: 'agy' as const,
             label: t('accounts.client_cli', 'CLI'),
             icon: Terminal,
@@ -625,7 +733,7 @@ export default function MiniView() {
         )}>
             {/* 1. 顶栏：macOS 风格分段 Tab 与快捷工具 */}
             <div
-                className="flex-none flex items-center justify-between pl-2 pr-3 py-1.5 bg-gray-50/80 dark:bg-white/[0.03] rounded-t-2xl border-b border-gray-100 dark:border-white/[0.06] select-none cursor-default"
+                className="flex-none flex items-center justify-between gap-1 px-2 py-1.5 bg-gray-50/80 dark:bg-white/[0.03] rounded-t-2xl border-b border-gray-100 dark:border-white/[0.06] select-none cursor-default"
                 data-tauri-drag-region
                 onMouseDown={(e) => {
                     const target = e.target as HTMLElement;
@@ -637,16 +745,18 @@ export default function MiniView() {
                     }
                 }}
             >
-                {/* 3 应用客户端 Tab + 全池胶囊 */}
+                {/* 应用客户端 Tab + ASAR + 全池胶囊 (min-w-0 可横向滑动，绝不挤压右侧图钉按钮) */}
                 <div
-                    className="flex items-center bg-black/[0.04] dark:bg-white/[0.07] p-0.5 rounded-xl gap-0.5"
+                    className="flex items-center min-w-0 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden bg-black/[0.04] dark:bg-white/[0.07] p-0.5 rounded-xl gap-0.5"
                     data-tauri-drag-region="false"
                     onMouseDown={(e) => e.stopPropagation()}
                 >
                     {tabs.map((tab) => {
                         const Icon = tab.icon;
                         const isActive = activeTab === tab.key;
-                        const status = tab.key !== 'pool' ? getTabStatus(tab.key) : null;
+                        const status = (tab.key !== 'pool' && tab.key !== 'asar') ? getTabStatus(tab.key) : null;
+                        const isAsarReady = Boolean(asarStatus?.is_patched && bridgeStatus?.running);
+                        const isAsarStreaming = (asarTelemetry?.in_flight ?? 0) > 0;
                         return (
                             <button
                                 key={tab.key}
@@ -660,14 +770,30 @@ export default function MiniView() {
                                 }}
                                 title={tab.tooltip}
                                 className={clsx(
-                                    "relative flex items-center gap-1 px-2 py-0.5 rounded-lg text-[11px] whitespace-nowrap shrink-0 transition-all cursor-pointer outline-none focus:outline-none focus:ring-0 focus-visible:ring-0 select-none",
+                                    "relative flex items-center gap-1 px-1.5 py-0.5 rounded-lg text-[10.5px] whitespace-nowrap shrink-0 transition-all cursor-pointer outline-none focus:outline-none focus:ring-0 focus-visible:ring-0 select-none",
                                     isActive
-                                        ? "bg-white dark:bg-zinc-800 text-blue-600 dark:text-blue-400 font-bold shadow-xs border border-black/[0.06] dark:border-white/[0.1]"
+                                        ? tab.key === 'asar'
+                                            ? "bg-white dark:bg-zinc-800 text-emerald-600 dark:text-emerald-400 font-bold shadow-xs border border-emerald-500/25"
+                                            : "bg-white dark:bg-zinc-800 text-blue-600 dark:text-blue-400 font-bold shadow-xs border border-black/[0.06] dark:border-white/[0.1]"
                                         : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white font-medium hover:bg-black/[0.02] dark:hover:bg-white/[0.03]"
                                 )}
                             >
-                                <Icon className="w-3.5 h-3.5 shrink-0" />
+                                <Icon className={clsx("w-3 h-3 shrink-0", tab.key === 'asar' && isAsarReady && "text-emerald-500")} />
                                 <span className="shrink-0">{tab.label}</span>
+                                {tab.key === 'asar' && (
+                                    <span
+                                        className={clsx(
+                                            "w-1.5 h-1.5 rounded-full shrink-0 transition-colors",
+                                            isAsarStreaming
+                                                ? "bg-emerald-500 animate-ping"
+                                                : isAsarReady
+                                                    ? "bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.6)]"
+                                                    : bridgeStatus?.running || asarStatus?.is_patched
+                                                        ? "bg-amber-500"
+                                                        : "bg-gray-300 dark:bg-zinc-600"
+                                        )}
+                                    />
+                                )}
                                 {status && (
                                     <span
                                         className={clsx(
@@ -687,7 +813,7 @@ export default function MiniView() {
 
                 {/* 居中透明拖拽区：按住可拖动整个悬浮窗 */}
                 <div
-                    className="flex-1 h-full min-w-[12px] cursor-move"
+                    className="flex-1 h-full min-w-[4px] cursor-move"
                     data-tauri-drag-region
                     onMouseDown={(e) => {
                         e.preventDefault();
@@ -711,7 +837,7 @@ export default function MiniView() {
                         className="p-1 rounded-lg text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-white hover:bg-black/[0.04] dark:hover:bg-white/[0.08] transition-colors cursor-pointer outline-none focus:outline-none focus:ring-0 focus-visible:ring-0"
                         title={t('common.refresh', '刷新当前额度')}
                     >
-                        <RefreshCw size={13} className={clsx(isRefreshing && "animate-spin text-blue-500")} />
+                        <RefreshCw size={12} className={clsx(isRefreshing && "animate-spin text-blue-500")} />
                     </button>
                     <button
                         type="button"
@@ -719,14 +845,14 @@ export default function MiniView() {
                         onMouseDown={(e) => e.stopPropagation()}
                         onClick={handleTogglePin}
                         className={clsx(
-                            "p-1 rounded-lg transition-colors cursor-pointer outline-none focus:outline-none focus:ring-0 focus-visible:ring-0",
+                            "p-1 rounded-lg border transition-all cursor-pointer outline-none focus:outline-none focus:ring-0 focus-visible:ring-0",
                             isPinned
-                                ? "text-blue-500 bg-blue-50 dark:bg-blue-900/30 dark:text-blue-400"
-                                : "text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:bg-black/[0.04] dark:hover:bg-white/[0.08]"
+                                ? "text-blue-600 bg-blue-50 border-blue-200 dark:bg-blue-500/20 dark:text-blue-300 dark:border-blue-500/40 shadow-2xs"
+                                : "text-gray-500 border-transparent hover:text-gray-800 dark:text-gray-300 dark:hover:text-white hover:bg-black/[0.05] dark:hover:bg-white/[0.08]"
                         )}
-                        title={isPinned ? t('tray.unpin_desc', '已固定常驻（点击取消固定，失焦自动收起）') : t('tray.pin_desc', '固定在桌面（点击常驻桌面，不随失焦收起）')}
+                        title={isPinned ? t('tray.unpin_desc', 'Đã ghim luôn nổi (bấm để bỏ ghim)') : t('tray.pin_desc', 'Ghim cửa sổ luôn nổi trên màn hình (Always on Top)')}
                     >
-                        <Pin size={13} className={clsx("transition-transform", isPinned ? "fill-current rotate-45" : "")} />
+                        <Pin size={12} className={clsx("transition-transform", isPinned ? "fill-current rotate-45" : "")} />
                     </button>
                     <button
                         type="button"
@@ -743,7 +869,224 @@ export default function MiniView() {
 
             {/* 2. 核心内容区：尺寸固定，杜绝任何外部窗体拉伸 */}
             <div className="flex-1 overflow-y-auto overflow-x-hidden p-3 space-y-2.5 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-gray-200 dark:scrollbar-thumb-white/10">
-                {activeTab === 'pool' ? (
+                {(activeTab === 'classic' || activeTab === 'ide') && bridgeStatus?.running && asarStatus?.heartbeat_active && (
+                    <button
+                        type="button"
+                        onClick={() => setActiveTab('asar')}
+                        className="w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-xl bg-emerald-50/90 dark:bg-emerald-950/35 hover:bg-emerald-100/80 dark:hover:bg-emerald-950/55 border border-emerald-200/80 dark:border-emerald-700/40 text-[10.5px] text-emerald-800 dark:text-emerald-300 transition-colors cursor-pointer"
+                        title="Bấm để mở bảng điều khiển nhanh ASAR Zero-Reload Bridge"
+                    >
+                        <div className="flex items-center gap-1.5 min-w-0 truncate">
+                            <span
+                                className={clsx(
+                                    "w-1.5 h-1.5 rounded-full shrink-0",
+                                    (asarTelemetry?.in_flight ?? 0) > 0
+                                        ? "bg-emerald-500 animate-ping"
+                                        : "bg-emerald-500"
+                                )}
+                            />
+                            <span className="font-semibold truncate">
+                                ⚡ ASAR :{bridgeStatus.port} đang gánh:{' '}
+                                <span className="font-mono">
+                                    {asarTelemetry?.last_active_email || 'Sẵn sàng'}
+                                </span>
+                            </span>
+                        </div>
+                        <span className="shrink-0 font-mono font-bold text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-700 dark:text-emerald-300">
+                            {asarTelemetry?.in_flight ?? 0} luồng
+                        </span>
+                    </button>
+                )}
+
+                {activeTab === 'asar' ? (
+                    /* ASAR Zero-Reload Bridge Mini Quick-View */
+                    <div className="space-y-2.5">
+                        {/* Quick Toggles Row */}
+                        <div className="grid grid-cols-4 gap-1.5">
+                            {/* Patch Status */}
+                            <div className="p-2 rounded-xl bg-black/[0.02] dark:bg-white/[0.04] border border-black/[0.05] dark:border-white/[0.08] flex flex-col justify-between gap-1">
+                                <span className="text-[9.5px] text-gray-500 dark:text-gray-400 truncate">app.asar</span>
+                                <span
+                                    className={clsx(
+                                        "text-[10px] font-bold truncate",
+                                        asarStatus?.is_patched
+                                            ? "text-emerald-600 dark:text-emerald-400"
+                                            : "text-gray-500 dark:text-gray-400"
+                                    )}
+                                >
+                                    {asarStatus?.is_patched ? '✓ Patched' : 'Unpatched'}
+                                </span>
+                            </div>
+
+                            {/* Heartbeat Toggle */}
+                            <button
+                                type="button"
+                                disabled={asarBusy !== null}
+                                onClick={handleMiniToggleHeartbeat}
+                                className={clsx(
+                                    "p-2 rounded-xl border text-left flex flex-col justify-between gap-1 transition-all cursor-pointer",
+                                    asarStatus?.heartbeat_active
+                                        ? "bg-emerald-50/80 dark:bg-emerald-950/30 border-emerald-300/70 dark:border-emerald-700/50"
+                                        : "bg-black/[0.02] dark:bg-white/[0.04] border-black/[0.05] dark:border-white/[0.08]"
+                                )}
+                                title="Bật/tắt Heartbeat (ag_rot.act)"
+                            >
+                                <span className="text-[9.5px] text-gray-500 dark:text-gray-400 truncate">Heartbeat</span>
+                                <span
+                                    className={clsx(
+                                        "text-[10px] font-bold",
+                                        asarStatus?.heartbeat_active
+                                            ? "text-emerald-600 dark:text-emerald-400"
+                                            : "text-gray-500 dark:text-gray-400"
+                                    )}
+                                >
+                                    {asarStatus?.heartbeat_active ? '● ON' : '○ OFF'}
+                                </span>
+                            </button>
+
+                            {/* Bridge Server Toggle */}
+                            <button
+                                type="button"
+                                disabled={asarBusy !== null}
+                                onClick={handleMiniToggleBridge}
+                                className={clsx(
+                                    "p-2 rounded-xl border text-left flex flex-col justify-between gap-1 transition-all cursor-pointer",
+                                    bridgeStatus?.running
+                                        ? "bg-blue-50/80 dark:bg-blue-950/30 border-blue-300/70 dark:border-blue-700/50"
+                                        : "bg-black/[0.02] dark:bg-white/[0.04] border-black/[0.05] dark:border-white/[0.08]"
+                                )}
+                                title="Bật/tắt cổng Bridge :8989"
+                            >
+                                <span className="text-[9.5px] text-gray-500 dark:text-gray-400 truncate">
+                                    :{bridgeStatus?.port || asarStatus?.bridge_port || 8989}
+                                </span>
+                                <span
+                                    className={clsx(
+                                        "text-[10px] font-bold",
+                                        bridgeStatus?.running
+                                            ? "text-blue-600 dark:text-blue-400"
+                                            : "text-gray-500 dark:text-gray-400"
+                                    )}
+                                >
+                                    {bridgeStatus?.running ? '● Running' : '○ Stopped'}
+                                </span>
+                            </button>
+
+                            {/* Dual-Track Toggle */}
+                            <button
+                                type="button"
+                                disabled={asarBusy !== null}
+                                onClick={handleMiniToggleDualTrack}
+                                className={clsx(
+                                    "p-2 rounded-xl border text-left flex flex-col justify-between gap-1 transition-all cursor-pointer",
+                                    (asarTelemetry?.dual_track_enabled ?? true)
+                                        ? "bg-amber-50/80 dark:bg-amber-950/30 border-amber-300/70 dark:border-amber-700/50"
+                                        : "bg-black/[0.02] dark:bg-white/[0.04] border-black/[0.05] dark:border-white/[0.08]"
+                                )}
+                                title="Bật/tắt Dual-Track (Tách làn Claude Lead & Gemini Worker)"
+                            >
+                                <span className="text-[9.5px] text-gray-500 dark:text-gray-400 truncate">Dual-Track</span>
+                                <span
+                                    className={clsx(
+                                        "text-[10px] font-bold",
+                                        (asarTelemetry?.dual_track_enabled ?? true)
+                                            ? "text-amber-600 dark:text-amber-400"
+                                            : "text-gray-500 dark:text-gray-400"
+                                    )}
+                                >
+                                    {(asarTelemetry?.dual_track_enabled ?? true) ? '● Active' : '○ Off'}
+                                </span>
+                            </button>
+                        </div>
+
+                        {/* Live Active Account & Dual-Track Slots Card */}
+                        <div className="bg-gradient-to-br from-emerald-500/[0.06] to-cyan-500/[0.04] dark:from-emerald-500/[0.1] dark:to-cyan-500/[0.05] rounded-xl p-2.5 border border-emerald-500/20 space-y-2">
+                            <div className="flex items-center justify-between gap-2">
+                                <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                                    <span
+                                        className={clsx(
+                                            "w-2 h-2 rounded-full shrink-0",
+                                            (asarTelemetry?.in_flight ?? 0) > 0
+                                                ? "bg-emerald-500 animate-ping"
+                                                : bridgeStatus?.running
+                                                    ? "bg-emerald-500"
+                                                    : "bg-gray-400"
+                                        )}
+                                    />
+                                    <span className="text-[11px] font-bold text-gray-800 dark:text-zinc-100 truncate">
+                                        ⚡ Đang gánh IDE:{' '}
+                                        <span className="text-emerald-600 dark:text-emerald-400 font-mono">
+                                            {asarTelemetry?.last_active_email || 'Sẵn sàng'}
+                                        </span>
+                                    </span>
+                                </div>
+                                {asarTelemetry?.last_active_model && (
+                                    <span className="shrink-0 text-[9.5px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 max-w-[115px] truncate">
+                                        {asarTelemetry.last_active_model}
+                                    </span>
+                                )}
+                            </div>
+
+                            {(asarTelemetry?.dual_track_enabled ?? true) && (
+                                <div className="pt-1.5 border-t border-emerald-500/15 flex items-center justify-between gap-1.5 text-[10px]">
+                                    <div className="flex flex-col gap-0.5 min-w-0 flex-1">
+                                        <div className="truncate text-amber-700 dark:text-amber-300">
+                                            👑 Claude:{' '}
+                                            <span className="font-mono font-semibold">
+                                                {asarTelemetry?.claude_slot_email || 'Auto'}
+                                            </span>
+                                        </div>
+                                        <div className="truncate text-cyan-700 dark:text-cyan-300">
+                                            ⚡ Gemini:{' '}
+                                            <span className="font-mono font-semibold">
+                                                {asarTelemetry?.gemini_slot_email || 'Auto'}
+                                            </span>
+                                        </div>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        disabled={asarBusy !== null}
+                                        onClick={handleMiniResetSlots}
+                                        className="shrink-0 flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold bg-white/80 dark:bg-zinc-800/90 hover:bg-white dark:hover:bg-zinc-700 text-gray-700 dark:text-gray-200 border border-black/[0.08] dark:border-white/10 transition-colors cursor-pointer"
+                                        title="Reset các slot ghim Dual-Track"
+                                    >
+                                        <RotateCcw size={10} />
+                                        <span>Reset Slots</span>
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Compact 4-Metric Row */}
+                        <div className="grid grid-cols-4 gap-1.5 text-center">
+                            <div className="p-2 rounded-xl bg-black/[0.02] dark:bg-white/[0.04] border border-black/[0.05] dark:border-white/[0.08]">
+                                <div className="text-[9.5px] text-gray-500 dark:text-gray-400 truncate">Đang chạy</div>
+                                <div className="text-xs font-bold font-mono text-emerald-600 dark:text-emerald-400 mt-0.5">
+                                    {asarTelemetry?.in_flight ?? 0}
+                                </div>
+                            </div>
+                            <div className="p-2 rounded-xl bg-black/[0.02] dark:bg-white/[0.04] border border-black/[0.05] dark:border-white/[0.08]">
+                                <div className="text-[9.5px] text-gray-500 dark:text-gray-400 truncate">Tổng Req</div>
+                                <div className="text-xs font-bold font-mono text-gray-800 dark:text-zinc-100 mt-0.5">
+                                    {formatCompactNumber(asarTelemetry?.total_requests ?? 0)}
+                                </div>
+                            </div>
+                            <div className="p-2 rounded-xl bg-black/[0.02] dark:bg-white/[0.04] border border-black/[0.05] dark:border-white/[0.08]">
+                                <div className="text-[9.5px] text-gray-500 dark:text-gray-400 truncate">Tự xoay</div>
+                                <div className="text-xs font-bold font-mono text-amber-600 dark:text-amber-400 mt-0.5">
+                                    {asarTelemetry?.failover_count ?? 0}
+                                </div>
+                            </div>
+                            <div className="p-2 rounded-xl bg-black/[0.02] dark:bg-white/[0.04] border border-black/[0.05] dark:border-white/[0.08]" title="Input / Output Tokens">
+                                <div className="text-[9.5px] text-gray-500 dark:text-gray-400 truncate">Tokens</div>
+                                <div className="text-[10.5px] font-bold font-mono text-blue-600 dark:text-blue-400 mt-0.5 truncate">
+                                    {formatCompactNumber(asarTelemetry?.total_input_tokens ?? 0)}/
+                                    {formatCompactNumber(asarTelemetry?.total_output_tokens ?? 0)}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                ) : activeTab === 'pool' ? (
                     /* 全池生产力矩阵视图 */
                     accounts.length === 0 ? (
                         <div className="h-full flex flex-col items-center justify-center text-center opacity-50 space-y-2 py-6">
@@ -1031,9 +1374,9 @@ export default function MiniView() {
                 )}
             </div>
 
-                {/* 3. 底部托盘综合控制栏：Lemon 经典布局（左侧微型轻量开关、中间打开控制台主按钮、右侧退出应用） */}
+                {/* 3. 底部托盘综合控制栏：单行紧凑不折行布局 */}
                 <div
-                    className="flex-none h-10 bg-gray-50/95 dark:bg-black/40 rounded-b-2xl flex items-center justify-between px-3 text-[11px] text-gray-500 dark:text-gray-400 border-t border-gray-100 dark:border-white/[0.06] select-none cursor-default"
+                    className="flex-none h-10 bg-gray-50/95 dark:bg-black/40 rounded-b-2xl flex items-center justify-between gap-1.5 px-2.5 text-[11px] text-gray-500 dark:text-gray-400 border-t border-gray-100 dark:border-white/[0.06] select-none cursor-default"
                     data-tauri-drag-region
                     onMouseDown={(e) => {
                         const target = e.target as HTMLElement;
@@ -1048,16 +1391,16 @@ export default function MiniView() {
                     {/* 左侧：托盘轻量模式开关 (退出时释放内存) */}
                     <div
                         onClick={handleToggleLightweight}
-                        className="flex items-center gap-1.5 cursor-pointer hover:opacity-80 transition-opacity"
+                        className="min-w-0 flex items-center gap-1 cursor-pointer hover:opacity-80 transition-opacity whitespace-nowrap"
                         title={t('settings.lightweight_mode_desc', '开启后退出或最小化到托盘将彻底释放 WebView 内存')}
                     >
-                        <Feather size={12} className={clsx(config?.lightweight_mode ? "text-emerald-500" : "text-gray-400")} />
-                        <span className="font-medium text-gray-600 dark:text-gray-300">
+                        <Feather size={12} className={clsx("shrink-0", config?.lightweight_mode ? "text-emerald-500" : "text-gray-400")} />
+                        <span className="font-medium text-[10.5px] text-gray-600 dark:text-gray-300 truncate max-w-[92px]">
                             {t('tray.lightweight_mode', '轻量模式')}
                         </span>
                         {/* 微型开关组件 */}
                         <div className={clsx(
-                            "w-6 h-3.5 rounded-full p-0.5 transition-colors relative flex items-center",
+                            "w-6 h-3.5 rounded-full p-0.5 transition-colors relative flex items-center shrink-0",
                             config?.lightweight_mode ? "bg-emerald-500" : "bg-gray-300 dark:bg-zinc-600"
                         )}>
                             <div className={clsx(
@@ -1067,20 +1410,20 @@ export default function MiniView() {
                         </div>
                     </div>
 
-                    {/* 中间：打开主控制台核心按钮（Lemon 风格胶囊按钮） */}
+                    {/* 中间：打开主控制台核心按钮（单行不折行） */}
                     <button
                         onClick={handleMaximize}
-                        className="flex items-center gap-1.5 px-3.5 py-1 rounded-xl text-xs font-semibold bg-white dark:bg-zinc-800 hover:bg-gray-100 dark:hover:bg-zinc-700 text-gray-800 dark:text-zinc-100 border border-gray-200/90 dark:border-white/10 shadow-xs transition-all active:scale-95 cursor-pointer"
+                        className="shrink-0 flex items-center gap-1 px-2.5 py-1 rounded-xl text-[11px] font-semibold whitespace-nowrap bg-white dark:bg-zinc-800 hover:bg-gray-100 dark:hover:bg-zinc-700 text-gray-800 dark:text-zinc-100 border border-gray-200/90 dark:border-white/10 shadow-xs transition-all active:scale-95 cursor-pointer"
                         title={t('tray.open_console', '打开主控制台')}
                     >
-                        <Maximize2 size={12} className="text-blue-500" />
+                        <Maximize2 size={11} className="text-blue-500 shrink-0" />
                         <span>{t('tray.open_console', '打开主控制台')}</span>
                     </button>
 
                     {/* 右侧：退出应用 */}
                     <button
                         onClick={handleQuitApp}
-                        className="p-1.5 rounded-lg text-gray-400 hover:text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/30 transition-colors cursor-pointer"
+                        className="shrink-0 p-1.5 rounded-lg text-gray-400 hover:text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/30 transition-colors cursor-pointer"
                         title={t('tray.quit', '退出应用')}
                     >
                         <Power size={13} />

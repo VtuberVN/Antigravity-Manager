@@ -709,7 +709,7 @@ pub fn run() {
                     // 2. 自动启动转发逻辑
                     if config.proxy.auto_start {
                         if let Err(e) = commands::proxy::internal_start_proxy_service(
-                            config.proxy,
+                            config.proxy.clone(),
                             &state,
                             integration,
                             Arc::new(cf_state.inner().clone()),
@@ -719,6 +719,27 @@ pub fn run() {
                             error!("Failed to auto-start proxy service: {}", e);
                         } else {
                             info!("Proxy service auto-started successfully");
+                        }
+                    }
+
+                    // 2.1 Auto-start ASAR Zero-Reload Bridge & heartbeat when enabled or app.asar is patched
+                    let asar_patched = crate::modules::asar_patch::is_patched(None);
+                    if config.proxy.asar_bridge_enabled || asar_patched {
+                        let asar_port = if config.proxy.asar_bridge_port > 0 {
+                            config.proxy.asar_bridge_port
+                        } else {
+                            crate::modules::asar_patch::get_asar_bridge_port()
+                        };
+                        crate::modules::asar_patch::start_heartbeat(false);
+                        if let Err(e) =
+                            commands::proxy::ensure_asar_bridge_started(asar_port, &state).await
+                        {
+                            error!("Failed to auto-start ASAR Zero-Reload Bridge: {}", e);
+                        } else {
+                            info!(
+                                "ASAR Zero-Reload Bridge auto-started on 127.0.0.1:{}",
+                                asar_port
+                            );
                         }
                     }
 
@@ -1068,6 +1089,26 @@ pub fn run() {
             commands::is_claude_desktop_running,
             commands::close_claude_desktop,
             commands::launch_claude_desktop,
+            // ASAR Zero-Reload Bridge & Model Catalog commands
+            commands::asar::get_asar_status,
+            commands::asar::patch_asar,
+            commands::asar::unpatch_asar,
+            commands::asar::toggle_asar_heartbeat,
+            commands::asar::set_asar_bridge_port,
+            commands::asar::get_asar_bridge_status,
+            commands::asar::start_asar_bridge,
+            commands::asar::stop_asar_bridge,
+            commands::asar::list_catalog_models,
+            commands::asar::toggle_catalog_model,
+            commands::asar::upsert_catalog_model,
+            commands::asar::delete_catalog_model,
+            commands::asar::save_catalog_models,
+            commands::asar::reload_catalog_models,
+            commands::asar::sync_catalog_from_accounts,
+            commands::asar::get_catalog_path,
+            commands::asar::get_asar_telemetry,
+            commands::asar::set_asar_dual_track,
+            commands::asar::reset_asar_slots,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -1111,6 +1152,10 @@ pub fn run() {
                                     admin.stop().await;
                                 }
                             }
+
+                            // 2.1 停止 ASAR Zero-Reload Bridge 与 Heartbeat
+                            crate::commands::proxy::stop_asar_bridge_internal(&state).await;
+                            crate::modules::asar_patch::stop_heartbeat(false);
 
                             // 3. 停止业务代理实例及后台任务
                             if let Ok(mut lock) = tokio::time::timeout(std::time::Duration::from_millis(1000), state.instance.write()).await {

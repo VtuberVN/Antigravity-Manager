@@ -23,10 +23,11 @@ import Pagination from "../components/common/Pagination";
 import AccountErrorDialog from "../components/accounts/AccountErrorDialog";
 import { showToast } from "../components/common/ToastContainer";
 import { exportAccounts } from "../services/accountService";
+import { AsarTelemetrySnapshot, getAsarTelemetry } from "../services/asarService";
 import { useAccountStore } from "../stores/useAccountStore";
 import { useConfigStore } from "../stores/useConfigStore";
 import { Account, getAccountTier, ImportAccountEntry } from "../types/account";
-import { isAccountAbnormal } from "../utils/accountStatus";
+import { isAccountAbnormal, isAccountNeedsVerification } from "../utils/accountStatus";
 import { cn } from "../utils/cn";
 import { isTauri } from "../utils/env";
 import { request as invoke } from "../utils/request";
@@ -34,7 +35,7 @@ import { useTranslation } from "react-i18next";
 import { motion } from "framer-motion";
 import { useLocation } from "react-router-dom";
 
-type FilterType = "all" | "pro" | "ultra" | "enterprise" | "free" | "abnormal";
+type FilterType = "all" | "pro" | "ultra" | "enterprise" | "free" | "abnormal" | "need_verify";
 type ViewMode = "list" | "grid";
 
 
@@ -110,7 +111,7 @@ function Accounts() {
   useEffect(() => {
     if (location.state && (location.state as any).filter) {
       const targetFilter = (location.state as any).filter as FilterType;
-      if (['all', 'pro', 'ultra', 'enterprise', 'free', 'abnormal'].includes(targetFilter)) {
+      if (['all', 'pro', 'ultra', 'enterprise', 'free', 'abnormal', 'need_verify'].includes(targetFilter)) {
         setFilter(targetFilter);
       }
     }
@@ -126,6 +127,26 @@ function Accounts() {
   const [isWarmuping, setIsWarmuping] = useState(false);
   const [refreshingIds, setRefreshingIds] = useState<Set<string>>(new Set());
   const [errorAccountId, setErrorAccountId] = useState<string | null>(null);
+  const [asarTelemetry, setAsarTelemetry] = useState<AsarTelemetrySnapshot | null>(null);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const snap = await getAsarTelemetry();
+        if (!cancelled) setAsarTelemetry(snap);
+      } catch {
+        // Ignore transient telemetry errors
+      }
+    };
+    poll();
+    const timer = setInterval(poll, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, []);
 
   const executeSingleWarmup = async (accountId: string) => {
     setRefreshingIds((prev) => {
@@ -320,6 +341,7 @@ function Accounts() {
       enterprise: searchedAccounts.filter((a) => getAccountTier(a) === "enterprise").length,
       free: searchedAccounts.filter((a) => getAccountTier(a) === "free").length,
       abnormal: searchedAccounts.filter(isAccountAbnormal).length,
+      need_verify: searchedAccounts.filter(isAccountNeedsVerification).length,
     };
   }, [searchedAccounts]);
 
@@ -327,6 +349,7 @@ function Accounts() {
   const filteredAccounts = useMemo(() => {
     if (filter === "all") return searchedAccounts;
     if (filter === "abnormal") return searchedAccounts.filter(isAccountAbnormal);
+    if (filter === "need_verify") return searchedAccounts.filter(isAccountNeedsVerification);
     return searchedAccounts.filter((a) => getAccountTier(a) === filter);
   }, [searchedAccounts, filter]);
 
@@ -1035,6 +1058,32 @@ function Accounts() {
               {filterCounts.abnormal}
             </span>
           </button>
+
+          {/* 需要验证 / 手机验证 */}
+          <button
+            className={cn(
+              "flex px-2 lg:px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 lg:gap-1.5 whitespace-nowrap shrink-0",
+              filter === 'need_verify'
+                ? "bg-white dark:bg-base-100 text-amber-600 dark:text-amber-400 shadow-sm ring-1 ring-amber-500/20"
+                : filterCounts.need_verify > 0
+                  ? "text-amber-600 dark:text-amber-400 hover:text-amber-700 hover:bg-amber-50/50 dark:hover:bg-amber-950/20"
+                  : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content hover:bg-white/40"
+            )}
+            onClick={() => setFilter('need_verify')}
+            title={`${t('accounts.filter_need_verify', 'Need Verify')} (${filterCounts.need_verify})`}
+          >
+            <span className="hidden md:inline">{t('accounts.filter_need_verify', 'Need Verify')}</span>
+            <span className={cn(
+              "px-1.5 py-0.5 rounded-md text-[10px] font-bold transition-colors",
+              filter === 'need_verify'
+                ? "bg-amber-100 dark:bg-amber-500/20 text-amber-600 dark:text-amber-400"
+                : filterCounts.need_verify > 0
+                  ? "bg-amber-100/80 dark:bg-amber-900/40 text-amber-600 dark:text-amber-400 font-extrabold"
+                  : "bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400"
+            )}>
+              {filterCounts.need_verify}
+            </span>
+          </button>
         </div>
 
         <div className="flex-1 min-w-[8px]" />
@@ -1164,6 +1213,7 @@ function Accounts() {
                 onToggleAll={handleToggleAll}
                 currentAccountId={currentAccount?.id || null}
                 activeClients={activeClients}
+                asarTelemetry={asarTelemetry}
                 switchingAccountId={switchingAccountId}
                 onSwitch={handleSwitch}
                 onRefresh={handleRefresh}
@@ -1193,6 +1243,7 @@ function Accounts() {
               onToggleSelect={handleToggleSelect}
               currentAccountId={currentAccount?.id || null}
               activeClients={activeClients}
+              asarTelemetry={asarTelemetry}
               switchingAccountId={switchingAccountId}
               onSwitch={handleSwitch}
               onRefresh={handleRefresh}

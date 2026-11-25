@@ -7,12 +7,13 @@
   <p>Multi-platform automation & multi-account matrix dispatch console</p>
 
   <p>
-    <a href="https://github.com/lbjlaq/Antigravity-Manager/releases">
-      <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
+    <a href="https://github.com/VtuberVN/Antigravity-Manager/releases">
+      <img src="https://img.shields.io/github/v/release/VtuberVN/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
-    <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-5.0.4-blue?style=flat-square" alt="Version">
+    <a href="https://github.com/VtuberVN/Antigravity-Manager">
+      <img src="https://img.shields.io/badge/Version-5.0.4--pro-blue?style=flat-square" alt="Version">
     </a>
+    <img src="https://img.shields.io/badge/ASAR_Bridge-127.0.0.1%3A8989-10b981?style=flat-square" alt="ASAR Bridge">
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
     <img src="https://img.shields.io/badge/Frontend-React-61DAFB?style=flat-square" alt="React">
@@ -36,6 +37,52 @@
     <a href="./README_ZH.md">简体中文</a>
   </p>
 </div>
+
+---
+
+## ⚡ Antigravity Manager Pro — ASAR Zero-Reload Fork (`VtuberVN/Antigravity-Manager`)
+
+> **🇬🇧 Fork Notice:** This repository is a specialized **ASAR Zero-Reload Fork** maintained at [`VtuberVN/Antigravity-Manager`](https://github.com/VtuberVN/Antigravity-Manager), built on top of [`lbjlaq/Antigravity-Manager`](https://github.com/lbjlaq/Antigravity-Manager) (v5.0.4) and integrating the native `v1internal` hot-rotation engine from `AntigravityHotRotator`. Upstream auto-update checks are disabled/repointed so your ASAR bridge is never overwritten by stock upstream builds.
+>
+> **🇻🇳 Giới thiệu bản Fork:** Đây là phiên bản **Antigravity Manager Pro (ASAR Zero-Reload Fork)** tại [`VtuberVN/Antigravity-Manager`](https://github.com/VtuberVN/Antigravity-Manager), kế thừa nền tảng [`lbjlaq/Antigravity-Manager`](https://github.com/lbjlaq/Antigravity-Manager) (v5.0.4) kết hợp cơ chế xoay tài khoản nóng `v1internal` từ `AntigravityHotRotator`. Cơ chế tự cập nhật từ repo gốc đã được khóa/chuyển hướng để tránh ghi đè mất tính năng ASAR Bridge.
+
+### 🔥 What's New in This Fork / Điểm mới nổi bật (5 Core Upgrades)
+
+1. **Zero-Reload Native IDE Bridge (`127.0.0.1:8989`):**
+   - **EN:** Patches Antigravity IDE's `resources/app.asar` (with automatic `.bak` backup & one-click restore) to route `/v1internal:*` RPCs (`streamGenerateContent`, `generateContent`, `fetchAvailableModels`, `loadCodeAssist`) through a local Rust Axum bridge — rotating Google accounts **per HTTP request** without killing `language_server`, restarting the IDE, or modifying `state.vscdb`.
+   - **VI:** Vá trực tiếp `resources/app.asar` của Antigravity IDE (tự động sao lưu `.bak` & khôi phục 1 chạm) để điều hướng luồng `/v1internal:*` qua cầu nối Rust Axum nội bộ `127.0.0.1:8989` — xoay vòng tài khoản Google **trên từng request** mà không cần tắt IDE, không giết tiến trình `language_server`, không đụng chạm `state.vscdb`.
+2. **Dual-Track Multi-Agent Isolation (`👑 Claude Lead` vs `⚡ Gemini Worker`):**
+   - **EN:** Pins Claude Opus/Sonnet requests and Gemini Pro/Flash requests onto separate Google accounts in your pool so background subagents/workers never burn the quota or rate-limit window of your primary Claude coding session.
+   - **VI:** Tách luồng độc lập giữa `👑 Claude Lead` và `⚡ Gemini Worker` trên các tài khoản Google khác nhau trong bể (Pool), giúp các tác vụ phụ/subagent chạy Gemini không làm cạn quota hay dính rate-limit của tài khoản đang chạy Claude chính.
+3. **Adaptive TTFB Fast-Failover (`22s / 35s / 60s`) & Auto-Heal:**
+   - **EN:** Smart Time-To-First-Byte watchdog (`22s` standard, `35s` tools/vision, `60s` Claude/deep-thinking) instantly fails over on `429`/`503`/hung upstream, auto-heals `403 SERVICE_DISABLED` (project strip) & `400` `thoughtSignature`/`thinkingLevel` mismatches, and recovers empty-thinking SSE streams seamlessly.
+   - **VI:** Bộ canh thời gian phản hồi thông minh (`22s / 35s / 60s`) tự động nhảy sang tài khoản khỏe ngay khi gặp `429`/`503` hoặc treo mạng; tự chữa lỗi `403 SERVICE_DISABLED`, lỗi chữ ký `400 thoughtSignature`/`thinkingLevel` và tự phục hồi luồng SSE suy luận rỗng.
+4. **Future Model Auto-Discovery & Tier Priority (`ULTRA > PRO > FREE`):**
+   - **EN:** Zero hardcoded model ceiling — automatically discovers new upstream models live from `/v1internal:fetchAvailableModels` across your healthy pool (`ULTRA > PRO > FREE` priority) without leaking hidden internal subagent models into the IDE selector.
+   - **VI:** Tự động phát hiện và mở khóa các model mới từ `/v1internal:fetchAvailableModels` theo thứ tự ưu tiên gói `ULTRA > PRO > FREE` mà không cần hardcode tên model, đồng thời lọc sạch các model nội bộ ẩn để không làm rác menu chọn model trên IDE.
+5. **Unified Token Metering, Tray MiniView & Clean Ad-Free UI:**
+   - **EN:** Full zero-copy SSE `usageMetadata` token accounting (`prompt`, `candidates`, `cached`, `thoughts`) wired into Dashboard/Monitor/Token Stats, upgraded `430×460` System Tray MiniView with live Dual-Track badges, and removal of commercial affiliate relay promotions (`APIKEY.FUN` Transit Station).
+   - **VI:** Đo đếm chính xác 100% token SSE (`prompt`, `candidates`, `cached`, `thoughts`) đồng bộ thẳng vào Dashboard/Monitor/Token Stats, nâng cấp cửa sổ khay hệ thống `430×460` hiển thị trực tiếp trạng thái Dual-Track, và gỡ bỏ hoàn toàn mục quảng cáo trạm trung chuyển thương mại (`APIKEY.FUN`).
+
+### 📊 Comparison Table / Bảng so sánh kiến trúc
+
+| Feature / Tính năng | Stock Upstream (`lbjlaq` v5.0.4) | Standalone `AntigravityHotRotator` (C#) | **Antigravity Manager Pro (This Fork)** |
+| :--- | :--- | :--- | :--- |
+| **IDE Account Switching / Đổi tài khoản IDE** | Reloads IDE / restarts `language_server` + rewrites `state.vscdb` | Zero-Reload via `app.asar` patch (`127.0.0.1:8989`) | **Zero-Reload via `app.asar` patch (`127.0.0.1:8989`) + Classic mode fallback** |
+| **Multi-Agent Quota Isolation / Tách luồng** | Shared active IDE account | Single rotating cursor | **Dual-Track (`👑 Claude Lead` + `⚡ Gemini Worker`)** |
+| **Upstream Hang / `429` Recovery** | Manual switch or background quota poll | Basic retry on `429`/`503` | **Adaptive TTFB (`22s/35s/60s`) + `403`/`400`/SSE Thinking Auto-Heal** |
+| **Model Catalog / Danh mục Model** | Static mapping for external API clients | Static/manual `models_catalog.json` | **Live Auto-Discovery (`ULTRA > PRO > FREE`) + clean IDE dropdown** |
+| **OpenAI / Anthropic Gateway (`:8045`)** | ✅ Built-in multi-protocol gateway | ❌ IDE-only proxy | **✅ Both `:8045` Gateway AND `:8989` Native IDE Bridge sharing one Pool** |
+| **Token Stats & Request Monitor** | `:8045` proxy traffic only | Basic counter | **Unified `:8045` + `:8989` zero-copy SSE token metering** |
+
+### ⚖️ Honest Pros & Cons / Ưu điểm & Hạn chế thực tế
+
+- **✅ Pros / Ưu điểm:**
+  - **EN:** Zero IDE interruption mid-conversation (chat context & open terminals stay intact while accounts rotate seamlessly in milliseconds); unified Rust single-binary performance; shares one OAuth pool across Antigravity IDE (`:8989`) and Claude Code / Codex / OpenAI clients (`:8045`); one-click ASAR backup restoration.
+  - **VI:** Không bao giờ bị văng hay khởi động lại cửa sổ Antigravity IDE khi đang chat dở; hiệu năng Rust nhẹ và ổn định; dùng chung một bể tài khoản OAuth cho cả Antigravity IDE (`:8989`) lẫn Claude Code / Codex (`:8045`); có nút khôi phục file `app.asar.bak` gốc an toàn bất cứ lúc nào.
+- **⚠️ Cons & Trade-offs / Hạn chế cần lưu ý:**
+  - **EN:** Patching `app.asar` modifies the local IDE bundle (macOS requires automatic ad-hoc `codesign` re-signing, handled by the patcher; Windows may require Write permission if installed under `Program Files`); whenever Antigravity IDE itself updates to a new version, `app.asar` is replaced by the installer and you must click **"Patch ASAR"** once again (or leave Auto-Patch enabled); Antigravity Manager Pro must remain running in the system tray while coding so `127.0.0.1:8989` stays reachable.
+  - **VI:** Cơ chế vá `app.asar` can thiệp vào gói cài đặt cục bộ của IDE (trên macOS cần ký lại `codesign` ad-hoc tự động; trên Windows nếu cài trong `Program Files` có thể cần quyền ghi file); mỗi khi bản thân ứng dụng Antigravity IDE cập nhật phiên bản mới, bộ cài IDE sẽ ghi đè lại `app.asar` nên bạn cần bấm **"Patch ASAR"** lại 1 lần; đồng thời cần để Antigravity Manager Pro chạy ngầm ở khay hệ thống (System Tray) trong lúc code để cổng `127.0.0.1:8989` luôn mở.
 
 ---
 

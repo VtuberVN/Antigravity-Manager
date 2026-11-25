@@ -56,6 +56,7 @@ import { getGroupQuotaSummaries } from '../../utils/quotaDisplay';
 import { getValidationBlockedStatusLabel } from './accountValidationStatus';
 import { showToast } from '../common/ToastContainer';
 import { exportAccounts, releaseAccountQoSJail } from '../../services/accountService';
+import { AsarTelemetrySnapshot } from '../../services/asarService';
 import { copyToClipboard } from '../../utils/clipboard';
 import AccountSwitchMenu from './AccountSwitchMenu';
 import { QoSStatusBadge } from './QoSStatusBadge';
@@ -77,6 +78,7 @@ interface AccountTableProps {
     onToggleAll: () => void;
     currentAccountId: string | null;
     activeClients?: ActiveClientsStatus;
+    asarTelemetry?: AsarTelemetrySnapshot | null;
     switchingAccountId: string | null;
     onSwitch: (accountId: string, targetIde?: string) => void;
     onRefresh: (accountId: string) => void;
@@ -98,6 +100,7 @@ interface SortableRowProps {
     isRefreshing: boolean;
     isCurrent: boolean;
     activeClients?: ActiveClientsStatus;
+    asarTelemetry?: AsarTelemetrySnapshot | null;
     isSwitching: boolean;
     isDragging?: boolean;
     onSelect: () => void;
@@ -118,6 +121,7 @@ interface AccountRowContentProps {
     account: Account;
     isCurrent: boolean;
     activeClients?: ActiveClientsStatus;
+    asarTelemetry?: AsarTelemetrySnapshot | null;
     isRefreshing: boolean;
     isSwitching: boolean;
     isDisabled: boolean;
@@ -196,6 +200,7 @@ function SortableAccountRow({
     isRefreshing,
     isCurrent,
     activeClients,
+    asarTelemetry,
     isSwitching,
     isDragging,
     onSelect,
@@ -280,6 +285,7 @@ function SortableAccountRow({
                 account={account}
                 isCurrent={isCurrent}
                 activeClients={activeClients}
+                asarTelemetry={asarTelemetry}
                 isRefreshing={isRefreshing}
                 isSwitching={isSwitching}
                 isDisabled={Boolean(account.disabled)}
@@ -306,6 +312,7 @@ function AccountRowContent({
     account,
     isCurrent,
     activeClients,
+    asarTelemetry,
     isRefreshing,
     isSwitching,
     isDisabled,
@@ -430,17 +437,17 @@ function AccountRowContent({
                         {isClassic && (
                             <span
                                 className="px-2 py-0.5 rounded-md bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300 text-[10px] font-bold shadow-sm border border-blue-200/50 dark:border-blue-800/50"
-                                title={t('accounts.client_classic_tooltip', '当前 Antigravity 经典款客户端登录账号')}
+                                title={t('accounts.client_classic_tooltip', 'Tài khoản giữ phiên đăng nhập gốc của Antigravity Classic')}
                             >
-                                {t('accounts.client_classic', '经典款')}
+                                🏠 {t('accounts.client_classic', 'Classic')}
                             </span>
                         )}
                         {isIde && (
                             <span
                                 className="px-2 py-0.5 rounded-md bg-sky-100 dark:bg-sky-900/50 text-sky-700 dark:text-sky-300 text-[10px] font-bold shadow-sm border border-sky-200/50 dark:border-sky-800/50"
-                                title={t('accounts.client_ide_tooltip', '当前 Antigravity IDE 客户端登录账号')}
+                                title={t('accounts.client_ide_tooltip', 'Tài khoản giữ phiên đăng nhập gốc của Antigravity IDE Shell')}
                             >
-                                {t('accounts.client_ide', 'IDE')}
+                                🏠 {t('accounts.ide_native', 'IDE Native')}
                             </span>
                         )}
                         {isAgy && (
@@ -459,11 +466,73 @@ function AccountRowContent({
                                 {t('accounts.client_acp', 'Plugin')}
                             </span>
                         )}
-                        {!isClassic && !isIde && !isAgy && !isAcp && isCurrent && (
-                            <span className="px-2 py-0.5 rounded-md bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300 text-[10px] font-bold shadow-sm border border-blue-200/50 dark:border-blue-800/50">
-                                {t('accounts.current').toUpperCase()}
+                        {!isClassic && !isIde && !isAgy && !isAcp && (isCurrent || asarTelemetry?.native_current_account_id === account.id) && (
+                            <span
+                                className="px-2 py-0.5 rounded-md bg-sky-100 dark:bg-sky-900/50 text-sky-700 dark:text-sky-300 text-[10px] font-bold shadow-sm border border-sky-200/50 dark:border-sky-800/50"
+                                title={t('accounts.ide_native_tooltip', 'Tài khoản giữ phiên đăng nhập gốc của Antigravity IDE Shell')}
+                            >
+                                🏠 {t('accounts.ide_native', 'IDE Native')}
                             </span>
                         )}
+                        {(() => {
+                            const isAsarInFlight = Boolean(asarTelemetry?.asar_in_flight_account_ids?.includes(account.id));
+                            const isAsarActive = isAsarInFlight || asarTelemetry?.last_active_account_id === account.id;
+                            const isClaudeSlot = Boolean(asarTelemetry?.dual_track_enabled && asarTelemetry?.claude_slot_account_id === account.id);
+                            const isGeminiSlot = Boolean(asarTelemetry?.dual_track_enabled && asarTelemetry?.gemini_slot_account_id === account.id);
+                            const isProxyInFlight = Boolean(asarTelemetry?.proxy_in_flight_account_ids?.includes(account.id));
+                            const isProxyActive = isProxyInFlight || asarTelemetry?.proxy_last_account_id === account.id;
+
+                            return (
+                                <>
+                                    {isAsarActive && (
+                                        <span
+                                            className="px-2 py-0.5 rounded-md bg-emerald-100 dark:bg-emerald-950/70 text-emerald-700 dark:text-emerald-300 text-[10px] font-bold inline-flex items-center gap-1 shadow-sm border border-emerald-300/60 dark:border-emerald-700/60"
+                                            title={
+                                                asarTelemetry?.last_active_model && asarTelemetry?.last_active_account_id === account.id
+                                                    ? `ASAR Zero-Reload Bridge Active (${asarTelemetry.last_active_model})`
+                                                    : 'ASAR Zero-Reload Bridge Active'
+                                            }
+                                        >
+                                            {isAsarInFlight ? (
+                                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-ping" />
+                                            ) : (
+                                                <span>⚡</span>
+                                            )}
+                                            <span>ASAR Active</span>
+                                        </span>
+                                    )}
+                                    {isClaudeSlot && (
+                                        <span
+                                            className="px-1.5 py-0.5 rounded-md bg-amber-100/90 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 text-[10px] font-bold shadow-xs border border-amber-300/60 dark:border-amber-700/60"
+                                            title="Dual-Track Pinned Claude Lead Slot"
+                                        >
+                                            👑 Claude Slot
+                                        </span>
+                                    )}
+                                    {isGeminiSlot && (
+                                        <span
+                                            className="px-1.5 py-0.5 rounded-md bg-cyan-100/90 dark:bg-cyan-950/60 text-cyan-800 dark:text-cyan-300 text-[10px] font-bold shadow-xs border border-cyan-300/60 dark:border-cyan-700/60"
+                                            title="Dual-Track Pinned Gemini Worker Slot"
+                                        >
+                                            ⚡ Gemini Slot
+                                        </span>
+                                    )}
+                                    {isProxyActive && (
+                                        <span
+                                            className="px-2 py-0.5 rounded-md bg-indigo-100 dark:bg-indigo-950/70 text-indigo-700 dark:text-indigo-300 text-[10px] font-bold inline-flex items-center gap-1 shadow-sm border border-indigo-300/60 dark:border-indigo-700/60"
+                                            title="API Proxy (:8045) Active Account"
+                                        >
+                                            {isProxyInFlight ? (
+                                                <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-ping" />
+                                            ) : (
+                                                <span>🌐</span>
+                                            )}
+                                            <span>Proxy Active</span>
+                                        </span>
+                                    )}
+                                </>
+                            );
+                        })()}
                         {isDisabled && (
                             <span
                                 className="px-2 py-0.5 rounded-md bg-rose-100 dark:bg-rose-900/50 text-rose-700 dark:text-rose-300 text-[10px] font-bold flex items-center gap-1 shadow-sm border border-rose-200/50"
@@ -834,6 +903,7 @@ function AccountTable({
     onToggleAll,
     currentAccountId,
     activeClients,
+    asarTelemetry,
     switchingAccountId,
     onSwitch,
     onRefresh,
@@ -1058,6 +1128,7 @@ function AccountTable({
                                     isRefreshing={refreshingIds.has(account.id)}
                                     isCurrent={account.id === currentAccountId}
                                     activeClients={activeClients}
+                                    asarTelemetry={asarTelemetry}
                                     isSwitching={account.id === switchingAccountId}
                                     isDragging={account.id === activeId}
                                     onSelect={() => onToggleSelect(account.id)}
@@ -1103,6 +1174,7 @@ function AccountTable({
                                         account={activeAccount}
                                         isCurrent={activeAccount.id === currentAccountId}
                                         activeClients={activeClients}
+                                        asarTelemetry={asarTelemetry}
                                         isRefreshing={refreshingIds.has(activeAccount.id)}
                                         isSwitching={activeAccount.id === switchingAccountId}
                                         onSwitch={() => { }}

@@ -5,6 +5,7 @@ on:
     branches:
       - beta
       - main
+      - 'feat/*'
   workflow_dispatch:
     inputs:
       create_release:
@@ -86,6 +87,23 @@ jobs:
       - name: Build frontend
         run: npm run build
 
+      - name: Ensure NASM for BoringSSL (Windows)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+            Write-Host "NASM not found in PATH; installing via Chocolatey..."
+            choco install nasm -y --no-progress
+          }
+          foreach ($nasmDir in @("C:\Program Files\NASM", "C:\Program Files (x86)\NASM")) {
+            if (Test-Path "$nasmDir\nasm.exe") {
+              Write-Host "Adding $nasmDir to GITHUB_PATH"
+              "$nasmDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+              $env:PATH = "$nasmDir;$env:PATH"
+              break
+            }
+          }
+          nasm -v
+
       - name: Build Tauri Windows NSIS Installer
         run: npm run tauri build -- --bundles nsis
         env:
@@ -106,6 +124,10 @@ jobs:
             Write-Host " - $($f.FullName)"
             Copy-Item -Path $f.FullName -Destination "dist-artifacts/"
             Copy-Item -Path $f.FullName -Destination "dist-artifacts/Antigravity-Manager-Setup.exe"
+          }
+          $ver = "${{ steps.version_info.outputs.version }}"
+          if (Test-Path "src-tauri/target/release/antigravity-tools.exe") {
+            Copy-Item -Path "src-tauri/target/release/antigravity-tools.exe" -Destination "dist-artifacts/Antigravity.Tools_${ver}_x64-portable.exe"
           }
           $files = Get-ChildItem -Path "dist-artifacts"
           Write-Host "Staged dist-artifacts:"

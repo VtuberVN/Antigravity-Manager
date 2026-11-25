@@ -48,6 +48,7 @@ import { cn } from '../utils/cn';
 import { useProxyModels, getModelIcon } from '../hooks/useProxyModels';
 import GroupedSelect, { SelectOption } from '../components/common/GroupedSelect';
 import { CliSyncCard } from '../components/proxy/CliSyncCard';
+import AsarBridgePanel from '../components/proxy/AsarBridgePanel';
 import { listAccounts } from '../services/accountService';
 import { motion } from 'framer-motion';
 import CircuitBreaker from '../components/settings/CircuitBreaker';
@@ -3253,6 +3254,17 @@ print(response.choices[0].message.content)`;
                 {
                     !configLoading && !configError && appConfig && activeMenuTab === 'settings' && (
                         <div className="space-y-4">
+                            {/* ASAR Zero-Reload Bridge - 仅在桌面端显示 */}
+                            {isTauri() && (
+                                <CollapsibleCard
+                                    title={t('proxy.asar.title', { defaultValue: 'ASAR Zero-Reload Bridge' })}
+                                    icon={<Zap size={18} className="text-emerald-500" />}
+                                    defaultExpanded={true}
+                                >
+                                    <AsarBridgePanel />
+                                </CollapsibleCard>
+                            )}
+
                             {/* Account Scheduling & Rotation */}
                             <CollapsibleCard
                                 title={t('proxy.config.scheduling.title')}

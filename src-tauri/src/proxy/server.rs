@@ -449,6 +449,7 @@ pub struct AxumServer {
     pub proxy_pool_state: Arc<tokio::sync::RwLock<crate::proxy::config::ProxyPoolConfig>>, // [NEW] 代理池配置状态
     pub proxy_pool_manager: Arc<crate::proxy::proxy_pool::ProxyPoolManager>, // [NEW] 暴露代理池管理器供命令调用
     pub only_raw_quota_models: Arc<tokio::sync::RwLock<bool>>,
+    pub(crate) state: AppState,
 }
 
 impl AxumServer {
@@ -1192,6 +1193,7 @@ impl AxumServer {
             proxy_pool_state,
             proxy_pool_manager,
             only_raw_quota_models: only_raw_quota_models_state,
+            state: state.clone(),
         };
 
         let server_cancel_token = cancel_token.clone();
@@ -1383,7 +1385,7 @@ fn resolve_static_dist_path() -> Option<std::path::PathBuf> {
 }
 
 /// 绑定 TCP 监听器（启用地址复用，遇通配地址如 0.0.0.0 / :: 时自动开启 IPv6/IPv4 双栈支持）
-fn bind_tcp_listener(host: &str, port: u16) -> Result<tokio::net::TcpListener, String> {
+pub(crate) fn bind_tcp_listener(host: &str, port: u16) -> Result<tokio::net::TcpListener, String> {
     let clean_host = host.trim_matches('[').trim_matches(']');
     let is_wildcard = clean_host == "0.0.0.0" || clean_host == "::";
 

@@ -8,6 +8,8 @@ pub mod server;
 pub mod token_manager;
 
 // 新架构模块
+pub mod asar_bridge; // Dedicated 127.0.0.1:8989 ASAR Zero-Reload Bridge
+pub mod asar_model_catalog; // Dynamic Model Catalog & fetchAvailableModels injection
 pub mod audio; // 音频处理模块
 pub mod cache_manager; // Context Cache 管理 (前缀哈希 → cache_id 映射)
 pub mod cache_profile; // 签名缓存环境自适应预设
