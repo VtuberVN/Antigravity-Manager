@@ -17,11 +17,21 @@ import {
     Plus,
     ArrowUp,
     ArrowDown,
-    Check
+    Check,
+    Layers,
+    Search
 } from 'lucide-react';
 import { Account } from '../../types/account';
 import { useTranslation } from 'react-i18next';
 import { parseTags, formatTags, reorderTags } from '../../utils/tagUtils';
+import { useAccountStore } from '../../stores/useAccountStore';
+import {
+    getAccountDisplayModels,
+    getMissingPoolModels,
+    isFullCapabilityAccount,
+} from '../../utils/accountStatus';
+import { formatTimeRemaining, getQuotaColor } from '../../utils/format';
+import { cn } from '../../utils/cn';
 
 export interface AccountActionsModalProps {
     isOpen: boolean;
@@ -57,7 +67,20 @@ export default function AccountActionsModal({
     isRefreshing = false,
 }: AccountActionsModalProps) {
     const { t } = useTranslation();
-    const [currentView, setCurrentView] = useState<'menu' | 'tags'>('menu');
+    const [currentView, setCurrentView] = useState<'menu' | 'tags' | 'models'>('menu');
+    const [modelSearch, setModelSearch] = useState('');
+    const poolAccounts = useAccountStore((s) => s.accounts);
+    const displayModels = getAccountDisplayModels(account);
+    const isFull = isFullCapabilityAccount(account, poolAccounts);
+    const missingModels = isFull ? [] : getMissingPoolModels(account, poolAccounts);
+    const filteredDisplayModels = displayModels.filter((m) => {
+        const q = modelSearch.trim().toLowerCase();
+        if (!q) return true;
+        return (
+            (m.name || '').toLowerCase().includes(q) ||
+            (m.display_name || '').toLowerCase().includes(q)
+        );
+    });
 
     // Tags view state
     const [tags, setTags] = useState<string[]>([]);
@@ -68,6 +91,7 @@ export default function AccountActionsModal({
     useEffect(() => {
         if (isOpen) {
             setCurrentView('menu');
+            setModelSearch('');
             setTags(parseTags(account.custom_label));
             setInputValue('');
             setTagErrorMsg(null);
@@ -79,7 +103,7 @@ export default function AccountActionsModal({
         if (!isOpen) return;
         const handleKeyDown = (e: KeyboardEvent) => {
             if (e.key === 'Escape') {
-                if (currentView === 'tags') {
+                if (currentView === 'tags' || currentView === 'models') {
                     setCurrentView('menu');
                 } else {
                     onClose();
@@ -200,6 +224,45 @@ export default function AccountActionsModal({
 
                         {/* Body Content */}
                         <div className="p-6 space-y-6 max-h-[75vh] overflow-y-auto">
+                            {/* Section 0: Available Models & Quota */}
+                            {displayModels.length > 0 && (
+                                <button
+                                    type="button"
+                                    onClick={() => setCurrentView('models')}
+                                    className="w-full flex items-center justify-between gap-3 p-3 rounded-xl border border-purple-200/70 dark:border-purple-800/50 bg-purple-50/40 dark:bg-purple-950/20 hover:border-purple-500 dark:hover:border-purple-500 hover:bg-purple-50/70 dark:hover:bg-purple-500/10 transition-all text-left group"
+                                >
+                                    <div className="flex items-center gap-3 min-w-0">
+                                        <div className="p-2 rounded-lg bg-purple-100 text-purple-600 dark:bg-purple-500/15 dark:text-purple-300 flex-shrink-0">
+                                            <Layers size={18} />
+                                        </div>
+                                        <div className="min-w-0">
+                                            <div className="text-xs font-semibold text-gray-900 dark:text-base-content">
+                                                {t('accounts.actions_modal.models_title', 'Model khả dụng & Hạn ngạch')}
+                                            </div>
+                                            {missingModels.length > 0 && (
+                                                <div
+                                                    className="text-[11px] text-amber-600 dark:text-amber-400 truncate"
+                                                    title={missingModels.join(', ')}
+                                                >
+                                                    {t('accounts.actions_modal.models_missing', 'Thiếu')}: {missingModels.slice(0, 4).join(', ')}
+                                                    {missingModels.length > 4 ? ` +${missingModels.length - 4}` : ''}
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                    <span
+                                        className={cn(
+                                            'px-2 py-0.5 rounded-md text-[11px] font-bold border shrink-0',
+                                            isFull
+                                                ? 'bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300 border-purple-200/60 dark:border-purple-800/50'
+                                                : 'bg-sky-50 dark:bg-sky-900/30 text-sky-700 dark:text-sky-300 border-sky-200/60 dark:border-sky-800/50'
+                                        )}
+                                    >
+                                        {isFull ? '✨ Full' : '🔹 Basic'} ({displayModels.length} models)
+                                    </span>
+                                </button>
+                            )}
+
                             {/* Section 1: Client Quick Switching */}
                             <div>
                                 <h4 className="text-xs font-semibold uppercase tracking-wider text-gray-400 dark:text-gray-500 mb-3">
@@ -468,6 +531,136 @@ export default function AccountActionsModal({
                                 className="btn btn-sm btn-ghost text-gray-600 dark:text-gray-300"
                             >
                                 {t('common.close')}
+                            </button>
+                        </div>
+                    </>
+                ) : currentView === 'models' ? (
+                    <>
+                        {/* Sub-view: Available Models & Quota */}
+                        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100 dark:border-base-200 bg-gray-50/50 dark:bg-base-200/40">
+                            <div className="flex items-center gap-3">
+                                <button
+                                    type="button"
+                                    onClick={() => setCurrentView('menu')}
+                                    className="p-1.5 -ml-1.5 rounded-lg hover:bg-gray-200 dark:hover:bg-base-300 text-gray-600 dark:text-gray-300 transition-colors flex items-center gap-1 text-xs font-semibold"
+                                    title={t('common.back', '返回')}
+                                >
+                                    <ChevronLeft size={16} />
+                                    <span>{t('common.back', '返回')}</span>
+                                </button>
+                                <div className="w-px h-4 bg-gray-200 dark:bg-base-300" />
+                                <div>
+                                    <h3 className="font-bold text-sm text-gray-900 dark:text-base-content leading-tight flex items-center gap-2">
+                                        <span>{t('accounts.actions_modal.models_title', 'Model khả dụng & Hạn ngạch')}</span>
+                                        <span
+                                            className={cn(
+                                                'px-1.5 py-0.5 rounded-md text-[10px] font-bold border',
+                                                isFull
+                                                    ? 'bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300 border-purple-200/60 dark:border-purple-800/50'
+                                                    : 'bg-sky-50 dark:bg-sky-900/30 text-sky-700 dark:text-sky-300 border-sky-200/60 dark:border-sky-800/50'
+                                            )}
+                                        >
+                                            {isFull ? '✨ Full' : '🔹 Basic'} ({displayModels.length})
+                                        </span>
+                                    </h3>
+                                    <p className="text-[11px] text-gray-500 dark:text-gray-400 truncate max-w-[260px] leading-tight">
+                                        {account.email}
+                                    </p>
+                                </div>
+                            </div>
+                            <button
+                                onClick={onClose}
+                                className="btn btn-sm btn-circle btn-ghost text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+                            >
+                                <X size={18} />
+                            </button>
+                        </div>
+
+                        <div className="p-6 space-y-4 max-h-[70vh] overflow-y-auto">
+                            <div className="relative">
+                                <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+                                <input
+                                    type="text"
+                                    value={modelSearch}
+                                    onChange={(e) => setModelSearch(e.target.value)}
+                                    placeholder={t('common.search', 'Tìm model...')}
+                                    className="w-full pl-9 pr-3 py-2 text-sm rounded-xl bg-gray-50 dark:bg-base-200 border border-gray-200 dark:border-base-300 focus:outline-none focus:ring-2 focus:ring-purple-500/30 text-gray-900 dark:text-base-content"
+                                />
+                            </div>
+
+                            <div className="space-y-2">
+                                {filteredDisplayModels.length === 0 ? (
+                                    <div className="text-center py-8 text-sm text-gray-400">
+                                        {t('common.empty', 'Trống')}
+                                    </div>
+                                ) : (
+                                    filteredDisplayModels.map((m) => {
+                                        const pct = Math.max(0, Math.min(100, Math.round(m.percentage ?? 0)));
+                                        const color = getQuotaColor(pct);
+                                        const barClass =
+                                            color === 'success'
+                                                ? 'bg-emerald-500'
+                                                : color === 'warning'
+                                                    ? 'bg-amber-500'
+                                                    : color === 'error'
+                                                        ? 'bg-rose-500'
+                                                        : 'bg-gray-500';
+                                        return (
+                                            <div
+                                                key={m.name}
+                                                className="px-3 py-2 rounded-xl border border-gray-100 dark:border-base-300 bg-gray-50/60 dark:bg-base-200/50"
+                                            >
+                                                <div className="flex items-center justify-between gap-2">
+                                                    <div className="min-w-0">
+                                                        <div className="text-xs font-semibold text-gray-900 dark:text-base-content truncate">
+                                                            {m.display_name || m.name}
+                                                        </div>
+                                                        <div className="text-[10px] font-mono text-gray-400 truncate">{m.name}</div>
+                                                    </div>
+                                                    <div className="flex items-center gap-2 shrink-0 text-[11px]">
+                                                        {m.reset_time && (
+                                                            <span className="font-mono text-blue-600 dark:text-blue-400">
+                                                                R: {formatTimeRemaining(m.reset_time)}
+                                                            </span>
+                                                        )}
+                                                        <span className="font-mono font-bold text-gray-800 dark:text-gray-100">{pct}%</span>
+                                                    </div>
+                                                </div>
+                                                <div className="mt-1.5 h-1.5 rounded-full bg-gray-200 dark:bg-white/10 overflow-hidden">
+                                                    <div className={cn('h-full rounded-full transition-all', barClass)} style={{ width: `${pct}%` }} />
+                                                </div>
+                                            </div>
+                                        );
+                                    })
+                                )}
+                            </div>
+
+                            {missingModels.length > 0 && (
+                                <div className="pt-3 border-t border-gray-100 dark:border-base-300 space-y-2">
+                                    <div className="text-xs font-semibold uppercase tracking-wider text-amber-600 dark:text-amber-400">
+                                        {t('accounts.actions_modal.models_missing_section', 'Thiếu trên tài khoản này')}
+                                    </div>
+                                    <div className="flex flex-wrap gap-1.5">
+                                        {missingModels.map((name) => (
+                                            <span
+                                                key={name}
+                                                className="px-2 py-0.5 rounded-md text-[11px] font-medium bg-amber-50 dark:bg-amber-900/20 text-amber-700 dark:text-amber-300 border border-amber-200/60 dark:border-amber-800/50"
+                                            >
+                                                {name}
+                                            </span>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+
+                        <div className="flex items-center justify-end px-6 py-3 border-t border-gray-100 dark:border-base-200 bg-gray-50/50 dark:bg-base-200/40">
+                            <button
+                                type="button"
+                                onClick={() => setCurrentView('menu')}
+                                className="btn btn-sm btn-ghost text-gray-600 dark:text-gray-300"
+                            >
+                                {t('common.back', '返回')}
                             </button>
                         </div>
                     </>

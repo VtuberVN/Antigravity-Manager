@@ -30,7 +30,7 @@ import { AsarTelemetrySnapshot, getAsarTelemetry } from "../services/asarService
 import { useAccountStore } from "../stores/useAccountStore";
 import { useConfigStore } from "../stores/useConfigStore";
 import { Account, getAccountTier, ImportAccountEntry } from "../types/account";
-import { isAccountAbnormal, isAccountNeedsVerification } from "../utils/accountStatus";
+import { isAccountAbnormal, isAccountNeedsVerification, isFullCapabilityAccount } from "../utils/accountStatus";
 import { getGroupQuotaSummaries } from "../utils/quotaDisplay";
 import { cn } from "../utils/cn";
 import { isTauri } from "../utils/env";
@@ -48,6 +48,7 @@ interface HideFiltersState {
   hideNonPaid: boolean;
   hideNeedVerify: boolean;
   hideBanned403: boolean;
+  hideBasicModels: boolean;
 }
 
 const DEFAULT_HIDE_FILTERS: HideFiltersState = {
@@ -56,6 +57,7 @@ const DEFAULT_HIDE_FILTERS: HideFiltersState = {
   hideNonPaid: false,
   hideNeedVerify: false,
   hideBanned403: false,
+  hideBasicModels: false,
 };
 
 
@@ -395,8 +397,10 @@ function Accounts() {
     hideFilters.hideClaudeEmpty ||
     hideFilters.hideNonPaid ||
     hideFilters.hideNeedVerify ||
-    hideFilters.hideBanned403;
+    hideFilters.hideBanned403 ||
+    hideFilters.hideBasicModels;
 
+  // 「只显示可用」预设仅控制 5 个不可用账号过滤，hideBasicModels 保持可选
   const allHideFiltersActive =
     hideFilters.hideGeminiEmpty &&
     hideFilters.hideClaudeEmpty &&
@@ -410,6 +414,9 @@ function Accounts() {
 
     return baseFilteredAccounts.filter((acc) => {
       const tier = getAccountTier(acc);
+      if (hideFilters.hideBasicModels && !isFullCapabilityAccount(acc, accounts)) {
+        return false;
+      }
       if (hideFilters.hideNonPaid && tier !== "pro" && tier !== "ultra") {
         return false;
       }
@@ -446,7 +453,7 @@ function Accounts() {
       }
       return true;
     });
-  }, [baseFilteredAccounts, anyHideFilterActive, hideFilters]);
+  }, [baseFilteredAccounts, anyHideFilterActive, hideFilters, accounts]);
 
   // Pagination Logic
   const paginatedAccounts = useMemo(() => {
@@ -1307,13 +1314,14 @@ function Accounts() {
           type="button"
           onClick={() => {
             const nextVal = !allHideFiltersActive;
-            setHideFilters({
+            setHideFilters((prev) => ({
+              ...prev,
               hideGeminiEmpty: nextVal,
               hideClaudeEmpty: nextVal,
               hideNonPaid: nextVal,
               hideNeedVerify: nextVal,
               hideBanned403: nextVal,
-            });
+            }));
           }}
           className={cn(
             "px-2.5 py-1 rounded-lg font-bold inline-flex items-center gap-1 transition-all border cursor-pointer whitespace-nowrap",
@@ -1354,6 +1362,11 @@ function Accounts() {
             key: 'hideBanned403' as const,
             label: t('accounts.hide_banned_403', 'Ẩn Bị Ban / 403'),
             tooltip: 'Ẩn tài khoản bị cấm vĩnh viễn (Banned) hoặc lỗi 403 Forbidden',
+          },
+          {
+            key: 'hideBasicModels' as const,
+            label: t('accounts.hide_basic_models', 'Ẩn Basic'),
+            tooltip: 'Ẩn tài khoản 🔹 Basic (ít model hơn các nick ✨ Full trong pool)',
           },
         ].map((pill) => {
           const active = hideFilters[pill.key];

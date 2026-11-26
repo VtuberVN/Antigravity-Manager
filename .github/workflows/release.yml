@@ -376,7 +376,7 @@ jobs:
 
   publish-release:
     needs: [verify-release-target, build-tauri, build-android-arm64]
-    if: always() && needs.verify-release-target.result == 'success' && (needs.build-tauri.result == 'success' || needs.build-android-arm64.result == 'success')
+    if: ${{ !cancelled() && needs.verify-release-target.result == 'success' && (needs.build-tauri.result == 'success' || needs.build-android-arm64.result == 'success') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write

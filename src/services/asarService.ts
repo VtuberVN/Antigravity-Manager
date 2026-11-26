@@ -121,6 +121,9 @@ export interface AsarTelemetrySnapshot {
     proxy_last_email: string | null;
     proxy_in_flight_account_ids: string[];
     native_current_account_id: string | null;
+    equivalent_fallback_enabled?: boolean;
+    fallback_downgrade_count?: number;
+    last_fallback_route?: string | null;
 }
 
 export async function getCatalogPath(): Promise<string> {
@@ -141,4 +144,8 @@ export async function setAsarDualTrack(enabled: boolean): Promise<AsarTelemetryS
 
 export async function resetAsarSlots(): Promise<AsarTelemetrySnapshot> {
     return await invoke<AsarTelemetrySnapshot>('reset_asar_slots');
+}
+
+export async function setAsarEquivalentFallback(enabled: boolean): Promise<AsarTelemetrySnapshot> {
+    return await invoke<AsarTelemetrySnapshot>('set_asar_equivalent_fallback', { enabled });
 }

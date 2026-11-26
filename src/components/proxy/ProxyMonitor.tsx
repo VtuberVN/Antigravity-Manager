@@ -102,6 +102,41 @@ const MIN_COL_WIDTHS: Record<keyof ColumnWidths, number> = {
     time: 75,
 };
 
+function doesLogMatchMonitorFilter(
+    log: ProxyRequestLog,
+    searchFilter: string,
+    accountEmailFilter: string
+): boolean {
+    if (searchFilter === '__ERROR__') {
+        const isError = log.status < 200 || log.status >= 400 || Boolean(log.error);
+        if (!isError) return false;
+    }
+    if (accountEmailFilter) {
+        const email = (log.account_email || '').toLowerCase();
+        if (!email.includes(accountEmailFilter.toLowerCase())) return false;
+    }
+    const baseFilter = searchFilter === '__ERROR__' ? '' : searchFilter;
+    if (baseFilter.trim()) {
+        const haystack = [
+            log.model,
+            log.mapped_model,
+            log.upstream_model,
+            log.url,
+            log.method,
+            String(log.status),
+            log.protocol,
+            log.account_email,
+            log.error,
+        ]
+            .filter(Boolean)
+            .join(' ')
+            .toLowerCase();
+        const tokens = baseFilter.toLowerCase().split(/\s+/).filter(Boolean);
+        if (!tokens.every((tok) => haystack.includes(tok))) return false;
+    }
+    return true;
+}
+
 function extractTtft(log: ProxyRequestLog): number | undefined {
     // 1. 优先从 response_headers 中读取
     if (log.response_headers) {
@@ -712,6 +747,10 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     // Pagination state
     const PAGE_SIZE_OPTIONS = [50, 100, 200, 500];
     const [pageSize, setPageSize] = useState(100);
+    const pageSizeRef = useRef(pageSize);
+    useEffect(() => {
+        pageSizeRef.current = pageSize;
+    }, [pageSize]);
     const [currentPage, setCurrentPage] = useState(1);
     const [totalCount, setTotalCount] = useState(0);
     const [loading, setLoading] = useState(false);
@@ -900,21 +939,35 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
 
                     const currentPending = pendingLogsRef.current;
                     if (currentPending.length > 0) {
-                        setLogs(prev => {
-                            // Deduplicate by id
-                            const existingIds = new Set(prev.map(log => log.id));
-                            const uniqueNewLogs = currentPending.filter(log => !existingIds.has(log.id));
-                            // Merge and sort by timestamp descending (newest first)
-                            const merged = [...uniqueNewLogs, ...prev];
-                            merged.sort((a, b) => b.timestamp - a.timestamp);
-                            return merged.slice(0, 100);
-                        });
+                        const activeFilter = filterRef.current;
+                        const activeAccountFilter = accountFilterRef.current;
+                        const matchingNewLogs = currentPending.filter(log =>
+                            doesLogMatchMonitorFilter(log, activeFilter, activeAccountFilter)
+                        );
 
-                        // Fetch stats, total count and latest account QoS states from backend
+                        // 仅在第 1 页且匹配当前筛选条件时才插入实时日志
+                        if (currentPageRef.current === 1 && matchingNewLogs.length > 0) {
+                            setLogs(prev => {
+                                // Deduplicate by id
+                                const existingIds = new Set(prev.map(log => log.id));
+                                const uniqueNewLogs = matchingNewLogs.filter(log => !existingIds.has(log.id));
+                                // Merge and sort by timestamp descending (newest first)
+                                const merged = [...uniqueNewLogs, ...prev];
+                                merged.sort((a, b) => b.timestamp - a.timestamp);
+                                return merged.slice(0, pageSizeRef.current);
+                            });
+                        }
+
+                        // Fetch stats, filtered total count and latest account QoS states from backend
                         try {
+                            const errorsOnly = activeFilter === '__ERROR__';
+                            const baseFilter = errorsOnly ? '' : activeFilter;
+                            const actualFilter = activeAccountFilter
+                                ? (baseFilter ? `${baseFilter} ${activeAccountFilter}` : activeAccountFilter)
+                                : baseFilter;
                             const [currentStats, count] = await Promise.all([
                                 invoke<ProxyStats>('get_proxy_stats'),
-                                invoke<number>('get_proxy_logs_count_filtered', { filter: '', errorsOnly: false }),
+                                invoke<number>('get_proxy_logs_count_filtered', { filter: actualFilter, errorsOnly }),
                                 fetchAccounts()
                             ]);
                             if (isMountedRef.current) {

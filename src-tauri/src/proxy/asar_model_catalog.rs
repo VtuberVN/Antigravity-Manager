@@ -381,7 +381,8 @@ impl AsarModelCatalog {
             list
         };
         let live_snapshot = self.live_nodes.read().unwrap().clone();
-        inject_with_catalog(original_json, &snapshot, &live_snapshot)
+        let restored = restore_richest_upstream(original_json);
+        inject_with_catalog(&restored, &snapshot, &live_snapshot)
     }
 
     /// Auto-discover user-selectable chat models from a live Google `fetchAvailableModels` JSON response:
@@ -395,6 +396,7 @@ impl AsarModelCatalog {
             return 0;
         };
         let sort_model_ids = collect_sort_model_ids(&root);
+        remember_richest_upstream(&root);
         let Some(Value::Object(models_map)) = root.remove("models") else {
             return 0;
         };
@@ -883,6 +885,141 @@ pub fn inject_models_into_fetch_response(original_json: &str) -> String {
 
 pub fn ingest_live_fetch_available_models(raw_json: &str) -> usize {
     GLOBAL_CATALOG.ingest_live_fetch_response(raw_json)
+}
+
+// ============================================================================
+// Layer 1 — Richest-catalog cache (keeps Carbon / Neon / Argon / Claude 5.5 visible in the IDE
+// even if a Basic account happens to answer `fetchAvailableModels`).
+// ============================================================================
+
+/// `true` for flagship canary models only exposed on "Full" accounts
+/// (`carbon`, `neon`, `argon`, `claude-*-5-5`, `claude-*-5-*`).
+pub(crate) fn is_flagship_canary_model(model: &str) -> bool {
+    let lower = strip_models_prefix(model.trim()).to_ascii_lowercase();
+    lower.contains("carbon")
+        || lower.contains("neon")
+        || lower.contains("argon")
+        || lower.contains("-5-5")
+        || (lower.contains("claude") && lower.contains("-5-"))
+}
+
+#[derive(Clone)]
+struct RichestUpstream {
+    score: usize,
+    models: Map<String, Value>,
+    sorts: Value,
+}
+
+fn richness_score(models: &Map<String, Value>) -> usize {
+    let flagship = models
+        .keys()
+        .filter(|k| is_flagship_canary_model(k))
+        .count();
+    flagship * 1000 + models.len()
+}
+
+fn richest_upstream_path() -> PathBuf {
+    get_catalog_path()
+        .parent()
+        .map(|p| p.join("asar_richest_upstream.json"))
+        .unwrap_or_else(|| PathBuf::from("asar_richest_upstream.json"))
+}
+
+fn load_richest_from_disk() -> Option<RichestUpstream> {
+    if cfg!(test) {
+        return None;
+    }
+    let content = fs::read_to_string(richest_upstream_path()).ok()?;
+    let Value::Object(root) = serde_json::from_str::<Value>(&content).ok()? else {
+        return None;
+    };
+    let Some(Value::Object(models)) = root.get("models").cloned() else {
+        return None;
+    };
+    let sorts = root
+        .get("agentModelSorts")
+        .cloned()
+        .unwrap_or(Value::Array(Vec::new()));
+    Some(RichestUpstream {
+        score: richness_score(&models),
+        models,
+        sorts,
+    })
+}
+
+static RICHEST_UPSTREAM: Lazy<RwLock<Option<RichestUpstream>>> =
+    Lazy::new(|| RwLock::new(load_richest_from_disk()));
+
+/// Remember the richest live `fetchAvailableModels` payload (models + `agentModelSorts`) seen so far.
+fn remember_richest_upstream(root: &Map<String, Value>) {
+    if cfg!(test) {
+        return;
+    }
+    let Some(Value::Object(models)) = root.get("models") else {
+        return;
+    };
+    let score = richness_score(models);
+    let sorts = root
+        .get("agentModelSorts")
+        .cloned()
+        .unwrap_or(Value::Array(Vec::new()));
+
+    let Ok(mut guard) = RICHEST_UPSTREAM.write() else {
+        return;
+    };
+    let existing_score = guard.as_ref().map(|r| r.score);
+    if existing_score.is_some_and(|s| score < s) {
+        return;
+    }
+    let should_persist = existing_score.is_none_or(|s| score > s);
+    *guard = Some(RichestUpstream {
+        score,
+        models: models.clone(),
+        sorts: sorts.clone(),
+    });
+    drop(guard);
+
+    if should_persist {
+        let payload = json!({ "models": models, "agentModelSorts": sorts });
+        let path = richest_upstream_path();
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(path, payload.to_string());
+    }
+}
+
+/// Restore missing flagship entries + sort groups into a poorer upstream response.
+fn merge_richest_into_response(original_json: &str, richest: &RichestUpstream) -> String {
+    let Ok(Value::Object(mut root)) = serde_json::from_str::<Value>(original_json) else {
+        return original_json.to_string();
+    };
+    let original_models = root
+        .get("models")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if richness_score(&original_models) >= richest.score {
+        return original_json.to_string();
+    }
+
+    let mut merged = original_models;
+    for (k, v) in &richest.models {
+        merged.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    root.insert("models".to_string(), Value::Object(merged));
+    if richest.sorts.as_array().is_some_and(|a| !a.is_empty()) {
+        root.insert("agentModelSorts".to_string(), richest.sorts.clone());
+    }
+    Value::Object(root).to_string()
+}
+
+fn restore_richest_upstream(original_json: &str) -> String {
+    let richest = RICHEST_UPSTREAM.read().ok().and_then(|g| g.clone());
+    match richest {
+        Some(r) => merge_richest_into_response(original_json, &r),
+        None => original_json.to_string(),
+    }
 }
 
 pub fn ingest_pool_model_ids<I: IntoIterator<Item = String>>(ids: I) -> usize {
@@ -1584,6 +1721,71 @@ pub fn default_catalog() -> Vec<CatalogModelEntry> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_layer1_richest_upstream_restores_flagship_models_and_sorts() {
+        let richest_json = json!({
+            "models": {
+                "gemini-4-hydrogen-medium": { "displayName": "Hydrogen" },
+                "gemini-4-carbon-medium": { "displayName": "Carbon" },
+                "claude-opus-5-5-high": { "displayName": "Opus 5.5" }
+            },
+            "agentModelSorts": [{
+                "displayName": "Recommended",
+                "groups": [{ "modelIds": [
+                    "gemini-4-carbon-medium",
+                    "claude-opus-5-5-high",
+                    "gemini-4-hydrogen-medium"
+                ]}]
+            }]
+        });
+        let Value::Object(root) = richest_json else {
+            panic!("object")
+        };
+        let Some(Value::Object(models)) = root.get("models").cloned() else {
+            panic!("models")
+        };
+        let richest = RichestUpstream {
+            score: richness_score(&models),
+            models,
+            sorts: root.get("agentModelSorts").cloned().unwrap(),
+        };
+        assert!(richest.score >= 2000);
+
+        // A Basic account answers with only Hydrogen.
+        let basic = json!({
+            "models": { "gemini-4-hydrogen-medium": { "displayName": "Hydrogen" } },
+            "agentModelSorts": [{
+                "displayName": "Recommended",
+                "groups": [{ "modelIds": ["gemini-4-hydrogen-medium"] }]
+            }]
+        })
+        .to_string();
+
+        let merged: Value =
+            serde_json::from_str(&merge_richest_into_response(&basic, &richest)).unwrap();
+        let models = merged["models"].as_object().unwrap();
+        assert!(models.contains_key("gemini-4-carbon-medium"));
+        assert!(models.contains_key("claude-opus-5-5-high"));
+        let ids = merged["agentModelSorts"][0]["groups"][0]["modelIds"]
+            .as_array()
+            .unwrap();
+        assert!(ids.iter().any(|v| v == "gemini-4-carbon-medium"));
+
+        // A response that is already as rich is returned untouched.
+        let full = json!({ "models": richest.models.clone() }).to_string();
+        assert_eq!(merge_richest_into_response(&full, &richest), full);
+    }
+
+    #[test]
+    fn test_flagship_canary_model_detection() {
+        assert!(is_flagship_canary_model("gemini-4-carbon-medium"));
+        assert!(is_flagship_canary_model("models/gemini-4-neon-high"));
+        assert!(is_flagship_canary_model("claude-sonnet-5-5-low"));
+        assert!(!is_flagship_canary_model("gemini-4-hydrogen-medium"));
+        assert!(!is_flagship_canary_model("gemini-3.5-flash-lite"));
+        assert!(!is_flagship_canary_model("claude-sonnet-4-6"));
+    }
 
     fn temp_catalog() -> (TempDir, AsarModelCatalog) {
         let dir = TempDir::new().unwrap();

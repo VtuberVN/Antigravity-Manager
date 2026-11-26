@@ -61,7 +61,7 @@ import { copyToClipboard } from '../../utils/clipboard';
 import AccountSwitchMenu from './AccountSwitchMenu';
 import { QoSStatusBadge } from './QoSStatusBadge';
 import { getLiveLimitForModel } from '../../utils/liveLimit';
-import { extractAccountVerificationUrl, isAccountNeedsVerification, isValidationBlockActive, openVerificationUrl } from '../../utils/accountStatus';
+import { extractAccountVerificationUrl, getAccountDisplayModels, getMissingPoolModels, isAccountNeedsVerification, isFullCapabilityAccount, isValidationBlockActive, openVerificationUrl } from '../../utils/accountStatus';
 import { parseTags } from '../../utils/tagUtils';
 import { isFlagshipModel, extractGemini4Codename } from '../../utils/modelCategory';
 import AccountActionsModal from './AccountActionsModal';
@@ -333,6 +333,10 @@ function AccountRowContent({
     const isPedaling = isPedalActive && targetAccountIds.includes(account.id);
     const isValidationBlocked = isValidationBlockActive(account);
     const needsVerify = isAccountNeedsVerification(account);
+    const poolAccounts = useAccountStore((s) => s.accounts);
+    const isFull = isFullCapabilityAccount(account, poolAccounts);
+    const displayModelCount = getAccountDisplayModels(account).length;
+    const missingModels = isFull ? [] : getMissingPoolModels(account, poolAccounts);
     const verifyUrl = needsVerify ? extractAccountVerificationUrl(account) : null;
     const validationBlockedLabel = getValidationBlockedStatusLabel(account.validation_blocked_reason, t);
     const isBanned = Boolean(account.banned);
@@ -626,6 +630,28 @@ function AccountRowContent({
                             onRelease={handleReleaseJail}
                         />
 
+
+                        {!isBanned && account.quota?.models && account.quota.models.length > 0 && (
+                            isFull ? (
+                                <button
+                                    type="button"
+                                    onClick={(e) => { e.stopPropagation(); onViewDetails(); }}
+                                    className="px-2 py-0.5 rounded-md bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300 text-[10px] font-bold border border-purple-200/60 dark:border-purple-800/50 cursor-pointer hover:brightness-95"
+                                    title={`Full: ${displayModelCount} models — được ưu tiên cho các lượt nặng. Bấm để xem chi tiết`}
+                                >
+                                    ✨ Full
+                                </button>
+                            ) : (
+                                <button
+                                    type="button"
+                                    onClick={(e) => { e.stopPropagation(); onViewDetails(); }}
+                                    className="px-2 py-0.5 rounded-md bg-sky-50 dark:bg-sky-900/30 text-sky-700 dark:text-sky-300 text-[10px] font-bold border border-sky-200/60 dark:border-sky-800/50 cursor-pointer hover:brightness-95"
+                                    title={`Basic: ${displayModelCount} models${missingModels.length ? ` — thiếu: ${missingModels.join(', ')}` : ''}. Tự động ưu tiên cho lượt nhẹ để tiết kiệm nick Full. Bấm để xem chi tiết`}
+                                >
+                                    🔹 Basic
+                                </button>
+                            )
+                        )}
 
                         {/* 订阅类型徽章 */}
                         {(() => {

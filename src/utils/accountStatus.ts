@@ -1,5 +1,6 @@
-import type { Account } from '../types/account';
+import type { Account, ModelQuota } from '../types/account';
 import { isTauri } from './env';
+import { isSupportedDisplayModel } from './quotaDisplay';
 
 /** 验证锁是否仍在有效窗口内；0 / 缺失表示无明确截止时间。 */
 export function isValidationBlockActive(
@@ -78,6 +79,24 @@ export async function openVerificationUrl(url: string): Promise<void> {
         }
     }
     window.open(url, '_blank', 'noopener,noreferrer');
+}
+
+/**
+ * 账号是否拥有 Full 金丝雀模型 (Carbon / Neon / Argon / 5.5 系列)，用于区分 Full 与 Basic (Hydrogen / 4.6) 账号。
+ */
+export function hasFullCanaryModels(account: Account): boolean {
+    const models = account.quota?.models;
+    if (!models || models.length === 0) return false;
+    return models.some((m) => {
+        const name = (m.name ?? '').toLowerCase();
+        if (!name || name.includes('disabled')) return false;
+        return (
+            name.includes('carbon') ||
+            name.includes('neon') ||
+            name.includes('argon') ||
+            name.includes('-5-5')
+        );
+    });
 }
 
 /**
@@ -240,4 +259,88 @@ export function formatWarmUpErrorDetail(error: unknown, maxLength: number = 180)
         return compact;
     }
     return `${compact.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+}
+
+
+// ============================================================================
+// Pool-dynamic capability tier (Full vs Basic)
+// ============================================================================
+
+/** 账号当前可展示的有效模型（排除 disabled / 不受支持的内部模型）。 */
+export function getAccountDisplayModels(account: Account): ModelQuota[] {
+    const models = account.quota?.models ?? [];
+    return models.filter(
+        (m) => isSupportedDisplayModel(m.name || '') && !(m as { disabled?: boolean }).disabled
+    );
+}
+
+/** 将模型 ID 归一化为模型家族（去掉 low/medium/high/xhigh/tiered/thinking 后缀）。 */
+export function getModelFamilyKey(name: string): string {
+    let key = (name ?? '').toLowerCase().trim();
+    for (let i = 0; i < 4; i++) {
+        const next = key.replace(/[-_](xhigh|high|medium|low|tiered|thinking)$/, '');
+        if (next === key) break;
+        key = next;
+    }
+    return key;
+}
+
+/** 家族 key -> 人类可读名称，如 gemini-4-carbon -> Gemini 4 Carbon。 */
+export function humanizeModelFamily(key: string): string {
+    return key
+        .split(/[-_]/)
+        .filter(Boolean)
+        .map((part) => (/^\d+$/.test(part) ? part : part.charAt(0).toUpperCase() + part.slice(1)))
+        .join(' ')
+        .replace(/(\d) (\d)/g, '$1.$2');
+}
+
+function getAccountFamilies(account: Account): Set<string> {
+    return new Set(getAccountDisplayModels(account).map((m) => getModelFamilyKey(m.name)));
+}
+
+function getHealthyPeers(allAccounts: Account[]): Account[] {
+    return allAccounts.filter(
+        (a) => !a.banned && !a.disabled && getAccountDisplayModels(a).length > 0
+    );
+}
+
+function getFullThreshold(peers: Account[]): { max: number; min: number; threshold: number } {
+    const counts = peers.map((a) => getAccountDisplayModels(a).length);
+    const max = Math.max(...counts);
+    const min = Math.min(...counts);
+    return { max, min, threshold: Math.ceil(max * 0.85) };
+}
+
+/**
+ * 池动态判定 ✨ Full / 🔹 Basic：
+ * 与池中健康账号的最大模型数比较，达到顶级梯队即为 Full；
+ * 池内仅 1 个账号时回退到 carbon/neon/argon/-5-5 检测。
+ */
+export function isFullCapabilityAccount(account: Account, allAccounts: Account[]): boolean {
+    const own = getAccountDisplayModels(account);
+    if (own.length === 0) return false;
+    const peers = getHealthyPeers(allAccounts);
+    if (peers.length <= 1) return hasFullCanaryModels(account);
+    const { max, min, threshold } = getFullThreshold(peers);
+    if (max === min) return true;
+    return own.length >= threshold;
+}
+
+/** 返回 Full 同伴账号拥有、但本账号缺失的模型家族（人类可读）。 */
+export function getMissingPoolModels(account: Account, allAccounts: Account[]): string[] {
+    const peers = getHealthyPeers(allAccounts);
+    if (peers.length <= 1) return [];
+    const { max, min, threshold } = getFullThreshold(peers);
+    if (max === min) return [];
+    const ownFamilies = getAccountFamilies(account);
+    const missing = new Set<string>();
+    for (const peer of peers) {
+        if (peer.id === account.id) continue;
+        if (getAccountDisplayModels(peer).length < threshold) continue;
+        for (const fam of getAccountFamilies(peer)) {
+            if (!ownFamilies.has(fam)) missing.add(fam);
+        }
+    }
+    return Array.from(missing).map(humanizeModelFamily);
 }

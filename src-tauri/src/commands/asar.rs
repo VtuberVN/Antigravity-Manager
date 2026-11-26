@@ -220,6 +220,16 @@ pub async fn set_asar_dual_track(
 }
 
 #[tauri::command]
+pub async fn set_asar_equivalent_fallback(
+    enabled: bool,
+    proxy_state: State<'_, crate::commands::proxy::ProxyServiceState>,
+) -> Result<AsarTelemetrySnapshot, String> {
+    asar_bridge::set_equivalent_fallback_enabled(enabled);
+    let app_state = current_app_state(&proxy_state).await;
+    Ok(asar_bridge::snapshot_asar_telemetry(app_state.as_ref()).await)
+}
+
+#[tauri::command]
 pub async fn reset_asar_slots(
     proxy_state: State<'_, crate::commands::proxy::ProxyServiceState>,
 ) -> Result<AsarTelemetrySnapshot, String> {

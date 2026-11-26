@@ -23,6 +23,7 @@ import {
     getAsarTelemetry,
     resetAsarSlots,
     setAsarDualTrack,
+    setAsarEquivalentFallback,
     startAsarBridge,
     stopAsarBridge,
     toggleAsarHeartbeat,
@@ -336,6 +337,20 @@ export default function MiniView() {
             setAsarTelemetry(snap);
         } catch (e) {
             console.error('Failed to toggle Dual-Track:', e);
+        } finally {
+            setAsarBusy(null);
+        }
+    };
+
+    const handleMiniToggleFallback = async () => {
+        if (asarBusy) return;
+        setAsarBusy('fb');
+        try {
+            const next = !(asarTelemetry?.equivalent_fallback_enabled ?? true);
+            const snap = await setAsarEquivalentFallback(next);
+            setAsarTelemetry(snap);
+        } catch (e) {
+            console.error('Failed to toggle equivalent fallback:', e);
         } finally {
             setAsarBusy(null);
         }
@@ -1066,6 +1081,31 @@ export default function MiniView() {
                                     </button>
                                 </div>
                             )}
+                            <div className="pt-1.5 border-t border-emerald-500/15 flex items-center justify-between gap-1.5 text-[10px]">
+                                <button
+                                    type="button"
+                                    disabled={asarBusy !== null}
+                                    onClick={handleMiniToggleFallback}
+                                    className={clsx(
+                                        "flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition-colors cursor-pointer shrink-0",
+                                        (asarTelemetry?.equivalent_fallback_enabled ?? true)
+                                            ? "bg-emerald-50/80 dark:bg-emerald-950/30 border-emerald-300/70 dark:border-emerald-700/50 text-emerald-700 dark:text-emerald-300"
+                                            : "bg-black/[0.02] dark:bg-white/[0.04] border-black/[0.05] dark:border-white/[0.08] text-gray-500 dark:text-gray-400"
+                                    )}
+                                    title="Auto-Fallback: khi hết nick Full (Carbon/Neon/Claude 5.5) tự chạy đỡ qua Hydrogen / Claude 4.6"
+                                >
+                                    <span>🛟 Fallback</span>
+                                    <span>{(asarTelemetry?.equivalent_fallback_enabled ?? true) ? '● ON' : '○ OFF'}</span>
+                                </button>
+                                {(asarTelemetry?.fallback_downgrade_count ?? 0) > 0 && (
+                                    <span
+                                        className="min-w-0 truncate px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-700 dark:text-amber-300 font-mono"
+                                        title={asarTelemetry?.last_fallback_route ?? ''}
+                                    >
+                                        ↘ {asarTelemetry?.fallback_downgrade_count}× {asarTelemetry?.last_fallback_route ?? ''}
+                                    </span>
+                                )}
+                            </div>
                         </div>
 
                         {/* Compact 4-Metric Row */}

@@ -25,6 +25,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -71,6 +72,9 @@ pub struct AsarTelemetrySnapshot {
     pub proxy_last_email: Option<String>,
     pub proxy_in_flight_account_ids: Vec<String>,
     pub native_current_account_id: Option<String>,
+    pub equivalent_fallback_enabled: bool,
+    pub fallback_downgrade_count: u64,
+    pub last_fallback_route: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,12 +95,24 @@ struct AsarTelemetryHub {
     total_cached_tokens: AtomicU64,
     last_active: RwLock<Option<LastActiveRecord>>,
     dual_track_enabled: AtomicBool,
+    equivalent_fallback_enabled: AtomicBool,
+    fallback_downgrade_count: AtomicU64,
+    last_fallback_route: RwLock<Option<String>>,
     claude_slot: RwLock<Option<(String, String)>>,
     gemini_slot: RwLock<Option<(String, String)>>,
+    /// Internal Gemini-Basic slot: sticks all non-flagship calls (Hydrogen / Flash / flash-lite)
+    /// to 1 Basic account for 99% prompt-cache hits; zero UI change — snapshot shows gemini_slot
+    /// if set, else falls back to this for the ⚡ Gemini row.
+    gemini_basic_slot: RwLock<Option<(String, String)>>,
 }
 
 impl AsarTelemetryHub {
     fn new() -> Self {
+        let (persisted_dual_track, persisted_fallback) = if cfg!(test) {
+            (true, true)
+        } else {
+            crate::modules::asar_patch::get_bridge_flags()
+        };
         Self {
             in_flight: AtomicU64::new(0),
             in_flight_by_account: DashMap::new(),
@@ -106,9 +122,13 @@ impl AsarTelemetryHub {
             total_output_tokens: AtomicU64::new(0),
             total_cached_tokens: AtomicU64::new(0),
             last_active: RwLock::new(None),
-            dual_track_enabled: AtomicBool::new(true),
+            dual_track_enabled: AtomicBool::new(persisted_dual_track),
+            equivalent_fallback_enabled: AtomicBool::new(persisted_fallback),
+            fallback_downgrade_count: AtomicU64::new(0),
+            last_fallback_route: RwLock::new(None),
             claude_slot: RwLock::new(None),
             gemini_slot: RwLock::new(None),
+            gemini_basic_slot: RwLock::new(None),
         }
     }
 
@@ -123,12 +143,44 @@ impl AsarTelemetryHub {
         }
     }
 
+    fn is_equivalent_fallback_enabled(&self) -> bool {
+        self.equivalent_fallback_enabled.load(Ordering::Relaxed)
+    }
+
+    fn set_equivalent_fallback(&self, enabled: bool) {
+        self.equivalent_fallback_enabled
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    fn record_fallback_route(&self, route: String) {
+        self.fallback_downgrade_count
+            .fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut g) = self.last_fallback_route.write() {
+            *g = Some(route);
+        }
+    }
+
+    /// Records the last active model/account. Background `*-flash-lite*` micro-model calls
+    /// (IDE title/summary generation) never overwrite an existing real active record.
+    fn record_active_guarded(&self, account_id: &str, email: &str, model: &str) {
+        if is_flash_lite_model(model) {
+            let has_existing = self.last_active.read().map(|g| g.is_some()).unwrap_or(true);
+            if has_existing {
+                return;
+            }
+        }
+        self.record_active(account_id, email, model);
+    }
+
     fn reset_slots(&self) {
         if let Ok(mut c) = self.claude_slot.write() {
             *c = None;
         }
         if let Ok(mut g) = self.gemini_slot.write() {
             *g = None;
+        }
+        if let Ok(mut b) = self.gemini_basic_slot.write() {
+            *b = None;
         }
     }
 
@@ -162,6 +214,32 @@ impl AsarTelemetryHub {
             if g.as_ref().is_some_and(|(id, _)| id == account_id) {
                 *g = None;
             }
+        }
+    }
+
+    fn get_gemini_basic_slot(&self) -> Option<(String, String)> {
+        self.gemini_basic_slot.read().ok().and_then(|g| g.clone())
+    }
+
+    fn set_gemini_basic_slot(&self, account_id: String, email: String) {
+        if let Ok(mut g) = self.gemini_basic_slot.write() {
+            *g = Some((account_id, email));
+        }
+    }
+
+    fn clear_gemini_basic_slot_if_matches(&self, account_id: &str) {
+        if let Ok(mut g) = self.gemini_basic_slot.write() {
+            if g.as_ref().is_some_and(|(id, _)| id == account_id) {
+                *g = None;
+            }
+        }
+    }
+
+    /// Clear whichever slot(s) this account might be pinned in after a failover.
+    fn clear_active_slot(&self, is_claude_track: bool, is_gemini_basic: bool, account_id: &str) {
+        self.clear_slot_if_matches(is_claude_track, account_id);
+        if is_gemini_basic {
+            self.clear_gemini_basic_slot_if_matches(account_id);
         }
     }
 
@@ -231,10 +309,108 @@ impl Drop for AsarInFlightGuard {
 
 pub fn set_dual_track_enabled(enabled: bool) {
     ASAR_TELEMETRY.set_dual_track(enabled);
+    if let Err(e) = crate::modules::asar_patch::persist_dual_track_flag(enabled) {
+        tracing::warn!("[ASAR-Bridge] Failed to persist dual_track flag: {}", e);
+    }
+}
+
+pub fn set_equivalent_fallback_enabled(enabled: bool) {
+    ASAR_TELEMETRY.set_equivalent_fallback(enabled);
+    if let Err(e) = crate::modules::asar_patch::persist_equivalent_fallback_flag(enabled) {
+        tracing::warn!(
+            "[ASAR-Bridge] Failed to persist equivalent_fallback flag: {}",
+            e
+        );
+    }
+}
+
+/// `true` for flagship canary models only available on "Full" accounts
+/// (`carbon`, `neon`, `argon`, `claude-*-5-5`).
+pub(crate) fn is_flagship_canary_model(model: &str) -> bool {
+    asar_model_catalog::is_flagship_canary_model(model)
+}
+
+/// `true` for Antigravity IDE's internal background micro-model (title / summary generation).
+pub(crate) fn is_flash_lite_model(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("flash-lite")
+}
+
+/// Map an exhausted flagship canary model to its graceful equivalent on Basic accounts.
+pub(crate) fn resolve_equivalent_fallback_model(target_model: &str) -> Option<String> {
+    let lower = target_model.trim().to_ascii_lowercase();
+    let lower = lower.strip_prefix("models/").unwrap_or(&lower);
+
+    if lower.contains("gemini-4-carbon")
+        || lower.contains("gemini-4-neon")
+        || lower.contains("gemini-4-argon")
+    {
+        let suffix = if lower.ends_with("-xhigh") {
+            "-xhigh"
+        } else if lower.ends_with("-high") {
+            "-high"
+        } else if lower.ends_with("-low") {
+            "-low"
+        } else {
+            "-medium"
+        };
+        return Some(format!("gemini-4-hydrogen{}", suffix));
+    }
+    if lower.starts_with("claude-opus-5") {
+        return Some("claude-opus-4-6-thinking".to_string());
+    }
+    if lower.starts_with("claude-sonnet-5") {
+        return Some("claude-sonnet-4-6".to_string());
+    }
+    if lower.starts_with("gemini-pro-orchestrator") {
+        return Some("gemini-4-hydrogen-high".to_string());
+    }
+    None
+}
+
+/// Sort key for `fetchAvailableModels` upstream account selection:
+/// `ULTRA > PRO > FREE`, then accounts holding flagship canary models, then richest catalog,
+/// then lowest manual priority.
+pub(crate) fn fetch_models_sort_key(
+    tier_rank: u8,
+    has_flagship_canary: bool,
+    available_models_len: usize,
+    priority: u8,
+) -> (u8, u8, usize, u8) {
+    (
+        tier_rank,
+        u8::from(!has_flagship_canary),
+        usize::MAX - available_models_len,
+        priority,
+    )
 }
 
 pub fn reset_dual_track_slots() {
     ASAR_TELEMETRY.reset_slots();
+}
+
+/// Derive a deterministic, per-account session ID from a raw session value.
+///
+/// Returns `"sess_"` + first 24 hex chars of `SHA-256("ag_asar:<account_id>:<raw_session>")`.
+/// Guarantees:
+/// - Same `(account_id, raw_session)` → same output on every call → 100% prompt-cache hit
+///   for repeated turns on the same account.
+/// - Different `account_id` for the same `raw_session` → different output → no cross-account
+///   correlation leak on Google's servers.
+pub(crate) fn isolate_session_for_account(account_id: &str, raw_session: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(format!("ag_asar:{}:{}", account_id, raw_session).as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest
+        .iter()
+        .flat_map(|b| {
+            [
+                char::from_digit((b >> 4) as u32, 16).unwrap_or('0'),
+                char::from_digit((b & 0xf) as u32, 16).unwrap_or('0'),
+            ]
+        })
+        .take(24)
+        .collect();
+    format!("sess_{}", hex)
 }
 
 pub async fn snapshot_asar_telemetry(state: Option<&AppState>) -> AsarTelemetrySnapshot {
@@ -244,7 +420,11 @@ pub async fn snapshot_asar_telemetry(state: Option<&AppState>) -> AsarTelemetryS
         .ok()
         .and_then(|g| g.clone());
     let claude_slot = ASAR_TELEMETRY.get_slot(true);
-    let gemini_slot = ASAR_TELEMETRY.get_slot(false);
+    // For the ⚡ Gemini row, prefer gemini_slot (Full flagship); fall back to gemini_basic_slot
+    // so the UI stays at 2 rows with no schema change.
+    let gemini_slot = ASAR_TELEMETRY
+        .get_slot(false)
+        .or_else(|| ASAR_TELEMETRY.get_gemini_basic_slot());
 
     let native_current_account_id = tokio::task::spawn_blocking(|| {
         crate::modules::account::get_current_account_id()
@@ -307,6 +487,15 @@ pub async fn snapshot_asar_telemetry(state: Option<&AppState>) -> AsarTelemetryS
         proxy_last_email,
         proxy_in_flight_account_ids,
         native_current_account_id,
+        equivalent_fallback_enabled: ASAR_TELEMETRY.is_equivalent_fallback_enabled(),
+        fallback_downgrade_count: ASAR_TELEMETRY
+            .fallback_downgrade_count
+            .load(Ordering::Relaxed),
+        last_fallback_route: ASAR_TELEMETRY
+            .last_fallback_route
+            .read()
+            .ok()
+            .and_then(|g| g.clone()),
     }
 }
 
@@ -482,7 +671,7 @@ pub(crate) fn fetch_models_tier_rank(tier: Option<&str>) -> u8 {
 }
 
 fn ordered_pool_account_ids_by_tier(state: &AppState) -> Vec<String> {
-    let mut candidates: Vec<(u8, u8, String)> = state
+    let mut candidates: Vec<((u8, u8, usize, u8), String)> = state
         .token_manager
         .enabled_account_ids()
         .into_iter()
@@ -495,11 +684,23 @@ fn ordered_pool_account_ids_by_tier(state: &AppState) -> Vec<String> {
                 .token_manager
                 .get_account_tier(&id)
                 .or(tok.subscription_tier.clone());
-            Some((fetch_models_tier_rank(tier.as_deref()), tok.priority, id))
+            let has_canary = tok
+                .available_models
+                .iter()
+                .any(|m| is_flagship_canary_model(m));
+            Some((
+                fetch_models_sort_key(
+                    fetch_models_tier_rank(tier.as_deref()),
+                    has_canary,
+                    tok.available_models.len(),
+                    tok.priority,
+                ),
+                id,
+            ))
         })
         .collect();
-    candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    candidates.into_iter().map(|(_, _, id)| id).collect()
+    candidates.sort_by_key(|a| a.0);
+    candidates.into_iter().map(|(_, id)| id).collect()
 }
 
 /// Intercept `/v1internal:fetchAvailableModels`:
@@ -697,6 +898,11 @@ async fn handle_v1internal_pool(
 
     let quota_group = classify_quota_group(&target_model);
     let is_claude_track = quota_group == "claude";
+    // Tri-slot tracks (only relevant when dual_track is on and this is an AI request):
+    // a) Claude track          → claude_slot
+    // b) Gemini Full track     → gemini_slot  (flagship canary: Carbon / Neon / Argon / Claude 5.5)
+    // c) Gemini Basic track    → gemini_basic_slot (Hydrogen, Flash, flash-lite — all non-flagship)
+    let mut is_gemini_basic_track = !is_claude_track && !is_flagship_canary_model(&target_model);
     let dual_track = is_ai_request && ASAR_TELEMETRY.is_dual_track_enabled();
 
     let client_session_id = headers
@@ -707,6 +913,8 @@ async fn handle_v1internal_pool(
     let effective_session_id = if dual_track {
         Some(if is_claude_track {
             "asar_slot_claude".to_string()
+        } else if is_gemini_basic_track {
+            "asar_slot_gemini_basic".to_string()
         } else {
             "asar_slot_gemini".to_string()
         })
@@ -729,409 +937,511 @@ async fn handle_v1internal_pool(
     let mut last_error_status = StatusCode::SERVICE_UNAVAILABLE;
     let mut last_error_body = String::from("No available accounts in Google Account Pool");
 
-    for _attempt in 0..max_account_attempts {
-        let token_res = select_account_for_request(
-            &state,
-            quota_group,
-            is_claude_track,
-            dual_track,
-            force_rotate,
-            effective_session_id.as_deref(),
-            &target_model,
-            pool_len,
-            &tried_accounts,
-        )
-        .await;
+    let mut fallback_used = false;
 
-        let (access_token, project_id, email, account_id, _wait_ms) = match token_res {
-            Ok(tuple) => tuple,
-            Err(e) => {
-                last_error_body = e;
-                break;
-            }
-        };
+    'fallback_pass: loop {
+        for _attempt in 0..max_account_attempts {
+            let token_res = select_account_for_request(
+                &state,
+                quota_group,
+                is_claude_track,
+                is_gemini_basic_track,
+                dual_track,
+                force_rotate,
+                effective_session_id.as_deref(),
+                &target_model,
+                pool_len,
+                &tried_accounts,
+            )
+            .await;
 
-        let mut retried_without_project = false;
-        let mut retried_sanitized = false;
-
-        // Per-account inner retry loop for same-account auto-heal (403 SERVICE_DISABLED, 400 signature/thinkingLevel)
-        loop {
-            let mut req_body = body_json.clone();
-            if !retried_without_project && !project_id.is_empty() {
-                rewrite_project_in_body(&mut req_body, &project_id);
-            } else if retried_without_project {
-                remove_project_from_body(&mut req_body);
-            }
-
-            let ttfb_secs = adaptive_ttfb_timeout_secs(&target_model, &req_body, body_len);
-            let in_flight_guard = if is_ai_request {
-                Some(AsarInFlightGuard::acquire(Some(account_id.clone())))
-            } else {
-                None
-            };
-
-            let upstream_fut = state.upstream.call_v1_internal_with_headers(
-                rpc_method,
-                &access_token,
-                req_body.clone(),
-                query.as_deref(),
-                extra_headers.clone(),
-                Some(&account_id),
-            );
-
-            let timed_res =
-                tokio::time::timeout(Duration::from_secs(ttfb_secs), upstream_fut).await;
-
-            let call_res = match timed_res {
-                Err(_elapsed) => {
-                    drop(in_flight_guard);
-                    tracing::warn!(
-                        "[ASAR-Bridge] Fast-Failover TTFB timeout (>{}s) on {}",
-                        ttfb_secs,
-                        email
-                    );
-                    ASAR_TELEMETRY.record_failover();
-                    if dual_track {
-                        ASAR_TELEMETRY.clear_slot_if_matches(is_claude_track, &account_id);
-                    }
-                    last_error_status = StatusCode::GATEWAY_TIMEOUT;
-                    last_error_body =
-                        format!("Upstream TTFB timeout (>{}s) on {}", ttfb_secs, email);
-                    tried_accounts.insert(account_id.clone());
-                    force_rotate = true;
-                    break;
-                }
-                Ok(Err(e)) => {
-                    drop(in_flight_guard);
-                    tracing::warn!(
-                        "[ASAR-Bridge] Upstream network error for {} ({}): {}",
-                        email,
-                        rpc_method,
-                        e
-                    );
-                    ASAR_TELEMETRY.record_failover();
-                    if dual_track {
-                        ASAR_TELEMETRY.clear_slot_if_matches(is_claude_track, &account_id);
-                    }
-                    last_error_status = StatusCode::BAD_GATEWAY;
+            let (access_token, project_id, email, account_id, _wait_ms) = match token_res {
+                Ok(tuple) => tuple,
+                Err(e) => {
                     last_error_body = e;
+                    break;
+                }
+            };
+
+            let mut retried_without_project = false;
+            let mut retried_sanitized = false;
+
+            // Per-account inner retry loop for same-account auto-heal (403 SERVICE_DISABLED, 400 signature/thinkingLevel)
+            loop {
+                let mut req_body = body_json.clone();
+                if !retried_without_project && !project_id.is_empty() {
+                    rewrite_project_in_body(&mut req_body, &project_id);
+                } else if retried_without_project {
+                    remove_project_from_body(&mut req_body);
+                }
+
+                // Per-account session isolation: rewrite sessionId fields in the body so
+                // concurrent accounts never share the same UUID on Google's servers, while
+                // repeated turns on the same account keep an identical hash → cache hit.
+                if is_ai_request {
+                    isolate_session_in_body(&mut req_body, &account_id);
+                }
+
+                // Per-account session header isolation + forward with scrubbed headers.
+                let mut per_account_headers = extra_headers.clone();
+                if is_ai_request {
+                    isolate_session_headers(&mut per_account_headers, &account_id);
+                }
+
+                let ttfb_secs = adaptive_ttfb_timeout_secs(&target_model, &req_body, body_len);
+                let in_flight_guard = if is_ai_request {
+                    Some(AsarInFlightGuard::acquire(Some(account_id.clone())))
+                } else {
+                    None
+                };
+
+                let upstream_fut = state.upstream.call_v1_internal_with_headers(
+                    rpc_method,
+                    &access_token,
+                    req_body.clone(),
+                    query.as_deref(),
+                    per_account_headers.clone(),
+                    Some(&account_id),
+                );
+
+                let timed_res =
+                    tokio::time::timeout(Duration::from_secs(ttfb_secs), upstream_fut).await;
+
+                let call_res = match timed_res {
+                    Err(_elapsed) => {
+                        drop(in_flight_guard);
+                        tracing::warn!(
+                            "[ASAR-Bridge] Fast-Failover TTFB timeout (>{}s) on {}",
+                            ttfb_secs,
+                            email
+                        );
+                        ASAR_TELEMETRY.record_failover();
+                        if dual_track {
+                            ASAR_TELEMETRY.clear_active_slot(
+                                is_claude_track,
+                                is_gemini_basic_track,
+                                &account_id,
+                            );
+                        }
+                        last_error_status = StatusCode::GATEWAY_TIMEOUT;
+                        last_error_body =
+                            format!("Upstream TTFB timeout (>{}s) on {}", ttfb_secs, email);
+                        tried_accounts.insert(account_id.clone());
+                        force_rotate = true;
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        drop(in_flight_guard);
+                        tracing::warn!(
+                            "[ASAR-Bridge] Upstream network error for {} ({}): {}",
+                            email,
+                            rpc_method,
+                            e
+                        );
+                        ASAR_TELEMETRY.record_failover();
+                        if dual_track {
+                            ASAR_TELEMETRY.clear_active_slot(
+                                is_claude_track,
+                                is_gemini_basic_track,
+                                &account_id,
+                            );
+                        }
+                        last_error_status = StatusCode::BAD_GATEWAY;
+                        last_error_body = e;
+                        tried_accounts.insert(account_id.clone());
+                        force_rotate = true;
+                        break;
+                    }
+                    Ok(Ok(r)) => r,
+                };
+
+                let status = call_res.response.status();
+
+                if status.is_success() {
+                    state.token_manager.mark_account_success(&account_id);
+                    if is_ai_request {
+                        ASAR_TELEMETRY.record_active_guarded(&account_id, &email, &target_model);
+                        // Background `*-flash-lite*` micro-calls must never pin the Gemini Worker slot.
+                        // Tri-slot routing: Basic Gemini track → gemini_basic_slot;
+                        //                  Gemini Full track   → gemini_slot (flagship canary only);
+                        //                  Claude track        → claude_slot.
+                        if dual_track {
+                            if is_gemini_basic_track {
+                                // flash-lite is allowed to pin gemini_basic_slot (it IS a basic call)
+                                ASAR_TELEMETRY
+                                    .set_gemini_basic_slot(account_id.clone(), email.clone());
+                            } else if !is_flash_lite_model(&target_model) {
+                                ASAR_TELEMETRY.set_slot(
+                                    is_claude_track,
+                                    account_id.clone(),
+                                    email.clone(),
+                                );
+                            }
+                        }
+                    }
+
+                    if is_stream {
+                        let resp_headers = call_res.response.headers().clone();
+                        let raw_stream = call_res
+                            .response
+                            .bytes_stream()
+                            .map_err(std::io::Error::other);
+
+                        let heal_ctx = ThinkingAutoHealContext {
+                            upstream: state.upstream.clone(),
+                            method: "streamGenerateContent",
+                            access_token: access_token.clone(),
+                            original_body: req_body,
+                            query_string: Some("alt=sse"),
+                            extra_headers: extra_headers.clone(),
+                            account_id: Some(account_id.clone()),
+                            trace_id: format!(
+                                "asar_{}",
+                                chrono::Utc::now().timestamp_subsec_millis()
+                            ),
+                            budget: None,
+                        };
+
+                        let healed_stream = wrap_stream_with_empty_thinking_auto_heal(
+                            Box::pin(raw_stream),
+                            heal_ctx,
+                        );
+
+                        let metered_stream = wrap_sse_stream_with_metering(
+                            healed_stream,
+                            state.clone(),
+                            rpc_method.to_string(),
+                            status.as_u16(),
+                            start_time,
+                            requested_model.clone(),
+                            target_model.clone(),
+                            email.clone(),
+                            effective_session_id.clone(),
+                            audit_req_body,
+                            in_flight_guard,
+                        );
+
+                        let mut builder = Response::builder().status(status);
+                        if let Some(ct) = resp_headers.get(axum::http::header::CONTENT_TYPE) {
+                            builder = builder.header(axum::http::header::CONTENT_TYPE, ct);
+                        } else {
+                            builder = builder
+                                .header(axum::http::header::CONTENT_TYPE, "text/event-stream");
+                        }
+                        builder = builder.header("cache-control", "no-cache");
+                        builder = builder.header("x-accel-buffering", "no");
+
+                        return builder
+                            .body(Body::from_stream(metered_stream))
+                            .unwrap_or_else(|e| {
+                                json_error(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    &format!("Stream response error: {}", e),
+                                )
+                            });
+                    } else {
+                        let resp_ct = call_res
+                            .response
+                            .headers()
+                            .get(axum::http::header::CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("application/json")
+                            .to_string();
+                        let resp_bytes = call_res.response.bytes().await.unwrap_or_default();
+                        let duration_ms = start_time.elapsed().as_millis() as u64;
+                        drop(in_flight_guard);
+
+                        let usage = if is_ai_request {
+                            extract_usage_from_bytes(&resp_bytes)
+                        } else {
+                            None
+                        };
+                        if let Some(ref u) = usage {
+                            ASAR_TELEMETRY.record_tokens(
+                                u.total_input_tokens,
+                                u.output_tokens,
+                                u.cached_tokens,
+                            );
+                        }
+
+                        if is_ai_request {
+                            record_bridge_log(
+                                &state,
+                                rpc_method,
+                                status.as_u16(),
+                                duration_ms,
+                                Some(&requested_model),
+                                Some(&target_model),
+                                Some(&email),
+                                None,
+                                usage.as_ref(),
+                                Some(duration_ms as f64),
+                                effective_session_id.as_deref(),
+                                audit_req_body,
+                            );
+                        }
+
+                        return Response::builder()
+                            .status(status)
+                            .header(axum::http::header::CONTENT_TYPE, resp_ct)
+                            .body(Body::from(resp_bytes))
+                            .unwrap_or_else(|e| {
+                                json_error(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    &format!("Response build error: {}", e),
+                                )
+                            });
+                    }
+                }
+
+                drop(in_flight_guard);
+
+                let retry_after = call_res
+                    .response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let err_body = call_res.response.text().await.unwrap_or_default();
+                last_error_status = status;
+                last_error_body = err_body.clone();
+
+                // 429 or 503 -> instant failover to next account
+                if status == StatusCode::TOO_MANY_REQUESTS
+                    || status == StatusCode::SERVICE_UNAVAILABLE
+                {
+                    tracing::warn!(
+                        "[ASAR-Bridge] {} returned {} for {} ({}), failing over to next account",
+                        email,
+                        status.as_u16(),
+                        target_model,
+                        rpc_method
+                    );
+                    ASAR_TELEMETRY.record_failover();
+                    if dual_track {
+                        ASAR_TELEMETRY.clear_active_slot(
+                            is_claude_track,
+                            is_gemini_basic_track,
+                            &account_id,
+                        );
+                    }
+                    state
+                        .token_manager
+                        .mark_rate_limited_fast(
+                            &email,
+                            status.as_u16(),
+                            retry_after.as_deref(),
+                            &err_body,
+                            Some(&target_model),
+                        )
+                        .await;
                     tried_accounts.insert(account_id.clone());
                     force_rotate = true;
                     break;
                 }
-                Ok(Ok(r)) => r,
-            };
 
-            let status = call_res.response.status();
-
-            if status.is_success() {
-                state.token_manager.mark_account_success(&account_id);
-                if is_ai_request {
-                    ASAR_TELEMETRY.record_active(&account_id, &email, &target_model);
-                    if dual_track {
-                        ASAR_TELEMETRY.set_slot(is_claude_track, account_id.clone(), email.clone());
-                    }
-                }
-
-                if is_stream {
-                    let resp_headers = call_res.response.headers().clone();
-                    let raw_stream = call_res
-                        .response
-                        .bytes_stream()
-                        .map_err(std::io::Error::other);
-
-                    let heal_ctx = ThinkingAutoHealContext {
-                        upstream: state.upstream.clone(),
-                        method: "streamGenerateContent",
-                        access_token: access_token.clone(),
-                        original_body: req_body,
-                        query_string: Some("alt=sse"),
-                        extra_headers: extra_headers.clone(),
-                        account_id: Some(account_id.clone()),
-                        trace_id: format!("asar_{}", chrono::Utc::now().timestamp_subsec_millis()),
-                        budget: None,
-                    };
-
-                    let healed_stream =
-                        wrap_stream_with_empty_thinking_auto_heal(Box::pin(raw_stream), heal_ctx);
-
-                    let metered_stream = wrap_sse_stream_with_metering(
-                        healed_stream,
-                        state.clone(),
-                        rpc_method.to_string(),
-                        status.as_u16(),
-                        start_time,
-                        requested_model.clone(),
-                        target_model.clone(),
-                        email.clone(),
-                        effective_session_id.clone(),
-                        audit_req_body,
-                        in_flight_guard,
-                    );
-
-                    let mut builder = Response::builder().status(status);
-                    if let Some(ct) = resp_headers.get(axum::http::header::CONTENT_TYPE) {
-                        builder = builder.header(axum::http::header::CONTENT_TYPE, ct);
-                    } else {
-                        builder =
-                            builder.header(axum::http::header::CONTENT_TYPE, "text/event-stream");
-                    }
-                    builder = builder.header("cache-control", "no-cache");
-                    builder = builder.header("x-accel-buffering", "no");
-
-                    return builder
-                        .body(Body::from_stream(metered_stream))
-                        .unwrap_or_else(|e| {
-                            json_error(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                &format!("Stream response error: {}", e),
-                            )
-                        });
-                } else {
-                    let resp_ct = call_res
-                        .response
-                        .headers()
-                        .get(axum::http::header::CONTENT_TYPE)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("application/json")
-                        .to_string();
-                    let resp_bytes = call_res.response.bytes().await.unwrap_or_default();
-                    let duration_ms = start_time.elapsed().as_millis() as u64;
-                    drop(in_flight_guard);
-
-                    let usage = if is_ai_request {
-                        extract_usage_from_bytes(&resp_bytes)
-                    } else {
-                        None
-                    };
-                    if let Some(ref u) = usage {
-                        ASAR_TELEMETRY.record_tokens(
-                            u.total_input_tokens,
-                            u.output_tokens,
-                            u.cached_tokens,
-                        );
-                    }
-
-                    if is_ai_request {
-                        record_bridge_log(
-                            &state,
-                            rpc_method,
-                            status.as_u16(),
-                            duration_ms,
-                            Some(&requested_model),
-                            Some(&target_model),
-                            Some(&email),
-                            None,
-                            usage.as_ref(),
-                            Some(duration_ms as f64),
-                            effective_session_id.as_deref(),
-                            audit_req_body,
-                        );
-                    }
-
-                    return Response::builder()
-                        .status(status)
-                        .header(axum::http::header::CONTENT_TYPE, resp_ct)
-                        .body(Body::from(resp_bytes))
-                        .unwrap_or_else(|e| {
-                            json_error(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                &format!("Response build error: {}", e),
-                            )
-                        });
-                }
-            }
-
-            drop(in_flight_guard);
-
-            let retry_after = call_res
-                .response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string);
-            let err_body = call_res.response.text().await.unwrap_or_default();
-            last_error_status = status;
-            last_error_body = err_body.clone();
-
-            // 429 or 503 -> instant failover to next account
-            if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE
-            {
-                tracing::warn!(
-                    "[ASAR-Bridge] {} returned {} for {} ({}), failing over to next account",
-                    email,
-                    status.as_u16(),
-                    target_model,
-                    rpc_method
-                );
-                ASAR_TELEMETRY.record_failover();
-                if dual_track {
-                    ASAR_TELEMETRY.clear_slot_if_matches(is_claude_track, &account_id);
-                }
-                state
-                    .token_manager
-                    .mark_rate_limited_fast(
-                        &email,
-                        status.as_u16(),
-                        retry_after.as_deref(),
-                        &err_body,
-                        Some(&target_model),
-                    )
-                    .await;
-                tried_accounts.insert(account_id.clone());
-                force_rotate = true;
-                break;
-            }
-
-            // 403 Forbidden -> SERVICE_DISABLED auto-heal, VALIDATION_REQUIRED block, or ToS/forbidden mark
-            if status == StatusCode::FORBIDDEN {
-                match classify_403_error(&err_body) {
-                    Forbidden403Kind::ServiceDisabled if !retried_without_project => {
-                        tracing::warn!(
+                // 403 Forbidden -> SERVICE_DISABLED auto-heal, VALIDATION_REQUIRED block, or ToS/forbidden mark
+                if status == StatusCode::FORBIDDEN {
+                    match classify_403_error(&err_body) {
+                        Forbidden403Kind::ServiceDisabled if !retried_without_project => {
+                            tracing::warn!(
                             "[ASAR-Bridge] 403 SERVICE_DISABLED for {} (project={}); retrying without project",
                             email,
                             project_id
                         );
-                        retried_without_project = true;
-                        continue;
-                    }
-                    Forbidden403Kind::LocationUnsupported => {
-                        tracing::warn!(
+                            retried_without_project = true;
+                            continue;
+                        }
+                        Forbidden403Kind::LocationUnsupported => {
+                            tracing::warn!(
                             "[ASAR-Bridge] 403 location unsupported for {}; rotating without marking account forbidden",
                             email
                         );
-                    }
-                    Forbidden403Kind::ValidationRequired => {
-                        tracing::warn!(
+                        }
+                        Forbidden403Kind::ValidationRequired => {
+                            tracing::warn!(
                             "[ASAR-Bridge] 403 VALIDATION_REQUIRED for {}; marking sticky validation_blocked",
                             email
                         );
-                        let extracted_url =
-                            crate::models::AccountBanInfo::extract_url_from_text(&err_body);
-                        let reason_str = crate::modules::account::format_validation_reason(
-                            &err_body,
-                            extracted_url.as_deref(),
-                        );
-                        if let Err(e) = state
-                            .token_manager
-                            .set_validation_block_public(&account_id, 0, &reason_str)
-                            .await
-                        {
-                            tracing::error!("[ASAR-Bridge] Failed to set validation block: {}", e);
+                            let extracted_url =
+                                crate::models::AccountBanInfo::extract_url_from_text(&err_body);
+                            let reason_str = crate::modules::account::format_validation_reason(
+                                &err_body,
+                                extracted_url.as_deref(),
+                            );
+                            if let Err(e) = state
+                                .token_manager
+                                .set_validation_block_public(&account_id, 0, &reason_str)
+                                .await
+                            {
+                                tracing::error!(
+                                    "[ASAR-Bridge] Failed to set validation block: {}",
+                                    e
+                                );
+                            }
                         }
-                    }
-                    Forbidden403Kind::ServiceDisabled | Forbidden403Kind::TosOrForbidden => {
-                        tracing::warn!(
+                        Forbidden403Kind::ServiceDisabled | Forbidden403Kind::TosOrForbidden => {
+                            tracing::warn!(
                             "[ASAR-Bridge] 403 Forbidden/ToS for {} on {}; marking forbidden and rotating",
                             email,
                             target_model
                         );
-                        let req_opt =
-                            (!requested_model.is_empty()).then_some(requested_model.as_str());
-                        if let Err(e) = state
-                            .token_manager
-                            .set_forbidden_with_models(
-                                &account_id,
-                                &err_body,
-                                req_opt,
-                                Some(&target_model),
-                            )
-                            .await
-                        {
-                            tracing::error!("[ASAR-Bridge] Failed to set forbidden status: {}", e);
+                            let req_opt =
+                                (!requested_model.is_empty()).then_some(requested_model.as_str());
+                            if let Err(e) = state
+                                .token_manager
+                                .set_forbidden_with_models(
+                                    &account_id,
+                                    &err_body,
+                                    req_opt,
+                                    Some(&target_model),
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    "[ASAR-Bridge] Failed to set forbidden status: {}",
+                                    e
+                                );
+                            }
                         }
                     }
+                    ASAR_TELEMETRY.record_failover();
+                    if dual_track {
+                        ASAR_TELEMETRY.clear_active_slot(
+                            is_claude_track,
+                            is_gemini_basic_track,
+                            &account_id,
+                        );
+                    }
+                    tried_accounts.insert(account_id.clone());
+                    force_rotate = true;
+                    break;
                 }
-                ASAR_TELEMETRY.record_failover();
-                if dual_track {
-                    ASAR_TELEMETRY.clear_slot_if_matches(is_claude_track, &account_id);
+
+                // 401 Unauthorized -> rotate account
+                if status == StatusCode::UNAUTHORIZED {
+                    tracing::warn!(
+                        "[ASAR-Bridge] 401 Unauthorized for {}; rotating account",
+                        email
+                    );
+                    ASAR_TELEMETRY.record_failover();
+                    if dual_track {
+                        ASAR_TELEMETRY.clear_active_slot(
+                            is_claude_track,
+                            is_gemini_basic_track,
+                            &account_id,
+                        );
+                    }
+                    tried_accounts.insert(account_id.clone());
+                    force_rotate = true;
+                    break;
                 }
-                tried_accounts.insert(account_id.clone());
-                force_rotate = true;
-                break;
-            }
 
-            // 401 Unauthorized -> rotate account
-            if status == StatusCode::UNAUTHORIZED {
-                tracing::warn!(
-                    "[ASAR-Bridge] 401 Unauthorized for {}; rotating account",
-                    email
-                );
-                ASAR_TELEMETRY.record_failover();
-                if dual_track {
-                    ASAR_TELEMETRY.clear_slot_if_matches(is_claude_track, &account_id);
-                }
-                tried_accounts.insert(account_id.clone());
-                force_rotate = true;
-                break;
-            }
+                // 400 Bad Request -> sanitize thoughtSignature / thinkingLevel and retry once
+                if status == StatusCode::BAD_REQUEST && is_ai_request && !retried_sanitized {
+                    let is_thinking_level_err =
+                        UpstreamClassification::is_unsupported_thinking_level(400, &err_body);
+                    let is_sig_err = is_thought_signature_400(&err_body);
 
-            // 400 Bad Request -> sanitize thoughtSignature / thinkingLevel and retry once
-            if status == StatusCode::BAD_REQUEST && is_ai_request && !retried_sanitized {
-                let is_thinking_level_err =
-                    UpstreamClassification::is_unsupported_thinking_level(400, &err_body);
-                let is_sig_err = is_thought_signature_400(&err_body);
-
-                if is_thinking_level_err || is_sig_err {
-                    retried_sanitized = true;
-                    if is_thinking_level_err {
-                        tracing::warn!(
+                    if is_thinking_level_err || is_sig_err {
+                        retried_sanitized = true;
+                        if is_thinking_level_err {
+                            tracing::warn!(
                             "[ASAR-Bridge] 400 unsupported thinkingLevel on {}; clamping to HIGH and retrying",
                             target_model
                         );
-                        InboundThinkingPipeline::try_clamp_thinking_level(&mut body_json);
-                        target_model = extract_model_from_v1internal_body(&body_json);
-                    }
-                    if is_sig_err {
-                        tracing::warn!(
+                            InboundThinkingPipeline::try_clamp_thinking_level(&mut body_json);
+                            target_model = extract_model_from_v1internal_body(&body_json);
+                        }
+                        if is_sig_err {
+                            tracing::warn!(
                             "[ASAR-Bridge] 400 thought signature error on {}; stripping signatures and retrying",
                             target_model
                         );
-                        InboundThinkingPipeline::strip_signatures_for_retry(
-                            &mut body_json,
-                            client_session_id.as_deref(),
-                            &target_model,
+                            InboundThinkingPipeline::strip_signatures_for_retry(
+                                &mut body_json,
+                                client_session_id.as_deref(),
+                                &target_model,
+                            );
+                        }
+                        continue;
+                    }
+                }
+
+                // 404 Model Not Found -> mark unsupported on this account and try next
+                if status == StatusCode::NOT_FOUND {
+                    ASAR_TELEMETRY.record_failover();
+                    if dual_track {
+                        ASAR_TELEMETRY.clear_active_slot(
+                            is_claude_track,
+                            is_gemini_basic_track,
+                            &account_id,
                         );
                     }
-                    continue;
+                    state.token_manager.mark_model_unsupported(
+                        &account_id,
+                        &target_model,
+                        Some(900),
+                    );
+                    tried_accounts.insert(account_id.clone());
+                    force_rotate = true;
+                    break;
                 }
-            }
 
-            // 404 Model Not Found -> mark unsupported on this account and try next
-            if status == StatusCode::NOT_FOUND {
-                ASAR_TELEMETRY.record_failover();
-                if dual_track {
-                    ASAR_TELEMETRY.clear_slot_if_matches(is_claude_track, &account_id);
-                }
-                state
-                    .token_manager
-                    .mark_model_unsupported(&account_id, &target_model, Some(900));
-                tried_accounts.insert(account_id.clone());
-                force_rotate = true;
-                break;
+                // Other non-retryable status -> return directly to client
+                record_bridge_log(
+                    &state,
+                    rpc_method,
+                    status.as_u16(),
+                    start_time.elapsed().as_millis() as u64,
+                    Some(&requested_model),
+                    Some(&target_model),
+                    Some(&email),
+                    Some(&err_body),
+                    None,
+                    None,
+                    effective_session_id.as_deref(),
+                    audit_req_body,
+                );
+                return Response::builder()
+                    .status(status)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(err_body))
+                    .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
             }
-
-            // Other non-retryable status -> return directly to client
-            record_bridge_log(
-                &state,
-                rpc_method,
-                status.as_u16(),
-                start_time.elapsed().as_millis() as u64,
-                Some(&requested_model),
-                Some(&target_model),
-                Some(&email),
-                Some(&err_body),
-                None,
-                None,
-                effective_session_id.as_deref(),
-                audit_req_body,
-            );
-            return Response::builder()
-                .status(status)
-                .header(axum::http::header::CONTENT_TYPE, "application/json")
-                .body(Body::from(err_body))
-                .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
         }
+
+        // Layer 3 — Graceful Equivalent Model Fallback: every account failed for the flagship
+        // canary model, so serve this single turn from its Basic equivalent (Carbon/Neon/Argon ->
+        // Hydrogen, Claude 5.5 -> 4.6) without changing the model shown in the IDE.
+        if !fallback_used && is_ai_request && ASAR_TELEMETRY.is_equivalent_fallback_enabled() {
+            if let Some(fallback_model) = resolve_equivalent_fallback_model(&target_model) {
+                if !fallback_model.eq_ignore_ascii_case(&target_model) {
+                    tracing::warn!(
+                        "[ASAR-Bridge] All accounts failed for {}; equivalent fallback -> {}",
+                        target_model,
+                        fallback_model
+                    );
+                    ASAR_TELEMETRY
+                        .record_fallback_route(format!("{} -> {}", target_model, fallback_model));
+                    rewrite_model_in_v1internal_body(&mut body_json, &fallback_model);
+                    InboundThinkingPipeline::strip_signatures_for_retry(
+                        &mut body_json,
+                        client_session_id.as_deref(),
+                        &fallback_model,
+                    );
+                    target_model = fallback_model;
+                    // Recalculate tri-slot track after model rewrite (Carbon → Hydrogen becomes Basic)
+                    is_gemini_basic_track =
+                        !is_claude_track && !is_flagship_canary_model(&target_model);
+                    tried_accounts.clear();
+                    force_rotate = false;
+                    fallback_used = true;
+                    continue 'fallback_pass;
+                }
+            }
+        }
+        break;
     }
 
     record_bridge_log(
@@ -1161,6 +1471,7 @@ async fn select_account_for_request(
     state: &AppState,
     quota_group: &str,
     is_claude_track: bool,
+    is_gemini_basic_track: bool,
     dual_track: bool,
     force_rotate: bool,
     session_id: Option<&str>,
@@ -1168,8 +1479,76 @@ async fn select_account_for_request(
     pool_len: usize,
     tried_accounts: &HashSet<String>,
 ) -> Result<(String, String, String, String, u64), String> {
-    // 1. If Dual-Track is active and this track already has a pinned healthy slot, prefer it first
-    if dual_track && !force_rotate {
+    // 0. Layer 2 — Capability-Tiered Burn Order: common (non-flagship) models burn Basic accounts
+    // first and keep Full accounts (Carbon / Neon / Argon / Claude 5.5) in reserve.
+    if !is_flagship_canary_model(target_model) {
+        let enabled_ids = state.token_manager.enabled_account_ids();
+        let canary_ids: HashSet<String> = enabled_ids
+            .iter()
+            .filter(|id| {
+                state.token_manager.get_token_by_id(id).is_some_and(|tok| {
+                    tok.available_models
+                        .iter()
+                        .any(|m| is_flagship_canary_model(m))
+                })
+            })
+            .cloned()
+            .collect();
+        let has_basic_candidate = enabled_ids
+            .iter()
+            .any(|id| !canary_ids.contains(id) && !tried_accounts.contains(id));
+        if !canary_ids.is_empty() && has_basic_candidate {
+            let mut exclusions = tried_accounts.clone();
+            exclusions.extend(canary_ids);
+            if let Ok(tuple) = get_token_with_25_fallback(
+                state,
+                quota_group,
+                force_rotate,
+                session_id,
+                target_model,
+                &exclusions,
+            )
+            .await
+            {
+                return Ok(tuple);
+            }
+        }
+    }
+
+    // 1a. Gemini Basic track — check gemini_basic_slot FIRST (preserves 99% prompt-cache for
+    //     Hydrogen / Flash / flash-lite by never spraying across all 6 Basic accounts at once).
+    if dual_track && is_gemini_basic_track && !force_rotate {
+        if let Some((basic_slot_id, _)) = ASAR_TELEMETRY.get_gemini_basic_slot() {
+            if !tried_accounts.contains(&basic_slot_id) {
+                let mut exclude_others: HashSet<String> = state
+                    .token_manager
+                    .enabled_account_ids()
+                    .into_iter()
+                    .filter(|id| id != &basic_slot_id)
+                    .collect();
+                exclude_others.extend(tried_accounts.iter().cloned());
+
+                if let Ok(tuple) = get_token_with_25_fallback(
+                    state,
+                    quota_group,
+                    false,
+                    session_id,
+                    target_model,
+                    &exclude_others,
+                )
+                .await
+                {
+                    return Ok(tuple);
+                } else {
+                    ASAR_TELEMETRY.clear_gemini_basic_slot_if_matches(&basic_slot_id);
+                }
+            }
+        }
+    }
+
+    // 1b. If Dual-Track is active and this track (Claude / Gemini Full) already has a pinned
+    //     healthy slot, prefer it first.
+    if dual_track && !is_gemini_basic_track && !force_rotate {
         if let Some((slot_acc_id, _slot_email)) = ASAR_TELEMETRY.get_slot(is_claude_track) {
             if !tried_accounts.contains(&slot_acc_id) {
                 let mut exclude_others: HashSet<String> = state
@@ -1296,7 +1675,34 @@ pub(crate) fn build_dual_track_initial_exclusions(
     Some(excl)
 }
 
-/// Adaptive TTFB Fast-Failover timeout:
+/// Rewrite `"sessionId"` / `"session_id"` at top level and inside a `"request"` envelope
+/// so each pool account receives a deterministic per-account session token.
+/// This ensures repeated turns on the **same** account hash to the same value (100% cache hit)
+/// while concurrent accounts on the same raw session never share a token on Google's servers.
+pub(crate) fn isolate_session_in_body(body: &mut Value, account_id: &str) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    for key in ["sessionId", "session_id"] {
+        if let Some(Value::String(s)) = obj.get(key).cloned() {
+            obj.insert(
+                key.to_string(),
+                Value::String(isolate_session_for_account(account_id, &s)),
+            );
+        }
+    }
+    if let Some(Value::Object(req)) = obj.get_mut("request") {
+        for key in ["sessionId", "session_id"] {
+            if let Some(Value::String(s)) = req.get(key).cloned() {
+                req.insert(
+                    key.to_string(),
+                    Value::String(isolate_session_for_account(account_id, &s)),
+                );
+            }
+        }
+    }
+}
+
 /// - `60s` for Claude/Opus or heavy body (`>15_000` bytes) with thinking
 /// - `35s` for Gemini with tools/images/search/thinking
 /// - `22s` for light text Gemini calls
@@ -1615,13 +2021,24 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
 }
 
 fn collect_extra_headers(headers: &HeaderMap) -> HashMap<String, String> {
+    /// Headers that could leak IDE-native project IDs or cross-account browser correlation.
+    /// These are stripped before forwarding to any pool account.
+    const STRIP_HEADERS: &[&str] = &[
+        "host",
+        "content-length",
+        "content-type",
+        "authorization",
+        "connection",
+        // Cross-account correlation headers — must never be forwarded as-is
+        "x-client-data",
+        "x-goog-request-params",
+        "x-vscode-machineid",
+        "x-machine-id",
+    ];
     let mut map = HashMap::new();
     for (k, v) in headers.iter() {
         let name = k.as_str().to_ascii_lowercase();
-        if matches!(
-            name.as_str(),
-            "host" | "content-length" | "content-type" | "authorization" | "connection"
-        ) {
+        if STRIP_HEADERS.contains(&name.as_str()) {
             continue;
         }
         if let Ok(val) = v.to_str() {
@@ -1629,6 +2046,20 @@ fn collect_extra_headers(headers: &HeaderMap) -> HashMap<String, String> {
         }
     }
     map
+}
+
+/// Apply per-account session isolation to `extra_headers` **in-place** before forwarding.
+/// Rewrites `x-session-id` / `x-vscode-sessionid` values so each account receives its own
+/// deterministic session token (100% prompt-cache on the same account, no cross-account leak).
+fn isolate_session_headers(headers: &mut HashMap<String, String>, account_id: &str) {
+    for key in ["x-session-id", "x-vscode-sessionid"] {
+        if let Some(orig) = headers.get(key).cloned() {
+            headers.insert(
+                key.to_string(),
+                isolate_session_for_account(account_id, &orig),
+            );
+        }
+    }
 }
 
 fn classify_quota_group(model: &str) -> &'static str {
@@ -2053,6 +2484,119 @@ mod tests {
     }
 
     #[test]
+    fn test_layer1_richest_catalog_first_sort_key() {
+        // PRO Full (26 models, canary) must beat PRO Basic (15 models) for fetchAvailableModels.
+        let full = fetch_models_sort_key(1, true, 26, 50);
+        let basic = fetch_models_sort_key(1, false, 15, 1);
+        assert!(full < basic);
+        // Tier still dominates: ULTRA Basic beats PRO Full.
+        let ultra_basic = fetch_models_sort_key(0, false, 15, 50);
+        assert!(ultra_basic < full);
+        // Among canary accounts, the richer catalog wins before manual priority.
+        let richer = fetch_models_sort_key(1, true, 30, 90);
+        let poorer = fetch_models_sort_key(1, true, 26, 1);
+        assert!(richer < poorer);
+    }
+
+    #[test]
+    fn test_layer2_flagship_canary_and_flash_lite_detection() {
+        for m in [
+            "gemini-4-carbon-medium",
+            "gemini-4-neon-xhigh",
+            "gemini-4-argon-high",
+            "claude-opus-5-5-high",
+            "claude-sonnet-5-5-low",
+        ] {
+            assert!(is_flagship_canary_model(m), "{m} must be flagship canary");
+        }
+        for m in [
+            "gemini-3.5-flash-lite",
+            "gemini-3.8-flash-high",
+            "gemini-4-hydrogen-medium",
+            "claude-sonnet-4-6",
+            "claude-opus-4-6-thinking",
+        ] {
+            assert!(!is_flagship_canary_model(m), "{m} must be common model");
+        }
+        assert!(is_flash_lite_model("gemini-3.5-flash-lite"));
+        assert!(is_flash_lite_model("Gemini-3.1-Flash-Lite"));
+        assert!(!is_flash_lite_model("gemini-3.8-flash-high"));
+    }
+
+    #[test]
+    fn test_layer2_flash_lite_never_overwrites_last_active_record() {
+        let hub = AsarTelemetryHub::new();
+        // First ever call may be recorded, even if flash-lite.
+        hub.record_active_guarded("acc-a", "a@x.com", "gemini-3.5-flash-lite");
+        assert_eq!(
+            hub.last_active.read().unwrap().as_ref().unwrap().model,
+            "gemini-3.5-flash-lite"
+        );
+        // Real model overwrites.
+        hub.record_active_guarded("acc-b", "b@x.com", "gemini-4-carbon-medium");
+        // Subsequent flash-lite must not overwrite the real record.
+        hub.record_active_guarded("acc-c", "c@x.com", "gemini-3.5-flash-lite");
+        let rec = hub.last_active.read().unwrap().clone().unwrap();
+        assert_eq!(rec.model, "gemini-4-carbon-medium");
+        assert_eq!(rec.account_id, "acc-b");
+    }
+
+    #[test]
+    fn test_layer3_equivalent_fallback_model_mapping() {
+        assert_eq!(
+            resolve_equivalent_fallback_model("gemini-4-carbon-medium").as_deref(),
+            Some("gemini-4-hydrogen-medium")
+        );
+        assert_eq!(
+            resolve_equivalent_fallback_model("gemini-4-neon-xhigh").as_deref(),
+            Some("gemini-4-hydrogen-xhigh")
+        );
+        assert_eq!(
+            resolve_equivalent_fallback_model("gemini-4-argon-high").as_deref(),
+            Some("gemini-4-hydrogen-high")
+        );
+        assert_eq!(
+            resolve_equivalent_fallback_model("gemini-4-carbon-low").as_deref(),
+            Some("gemini-4-hydrogen-low")
+        );
+        assert_eq!(
+            resolve_equivalent_fallback_model("gemini-4-carbon").as_deref(),
+            Some("gemini-4-hydrogen-medium")
+        );
+        assert_eq!(
+            resolve_equivalent_fallback_model("claude-opus-5-5-high").as_deref(),
+            Some("claude-opus-4-6-thinking")
+        );
+        assert_eq!(
+            resolve_equivalent_fallback_model("claude-sonnet-5-5-medium").as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(
+            resolve_equivalent_fallback_model("gemini-pro-orchestrator-argon").as_deref(),
+            Some("gemini-4-hydrogen-high")
+        );
+        // Already-basic models have no fallback.
+        assert!(resolve_equivalent_fallback_model("gemini-4-hydrogen-medium").is_none());
+        assert!(resolve_equivalent_fallback_model("claude-sonnet-4-6").is_none());
+        assert!(resolve_equivalent_fallback_model("gemini-3.8-flash-high").is_none());
+    }
+
+    #[test]
+    fn test_layer3_fallback_telemetry_counter_and_default_enabled() {
+        let hub = AsarTelemetryHub::new();
+        assert!(hub.is_equivalent_fallback_enabled());
+        hub.record_fallback_route("gemini-4-carbon-medium -> gemini-4-hydrogen-medium".into());
+        hub.record_fallback_route("claude-opus-5-5-high -> claude-opus-4-6-thinking".into());
+        assert_eq!(hub.fallback_downgrade_count.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            hub.last_fallback_route.read().unwrap().as_deref(),
+            Some("claude-opus-5-5-high -> claude-opus-4-6-thinking")
+        );
+        hub.set_equivalent_fallback(false);
+        assert!(!hub.is_equivalent_fallback_enabled());
+    }
+
+    #[test]
     fn test_audit_request_body_and_millis_timestamp() {
         // Timestamp must be Unix epoch in milliseconds (> 1_700_000_000_000), matching monitor.rs
         let ts = current_log_timestamp_millis();
@@ -2093,5 +2637,233 @@ mod tests {
         let full = format_audit_request_body(&payload, "full");
         assert!(full.contains("claude-sonnet-4-6"));
         assert!(full.contains(&"A".repeat(512)));
+    }
+
+    // ── New tests for Tri-Slot Sticky, Session Isolation & Header Scrubbing ────────────
+
+    #[test]
+    fn test_isolate_session_for_account_deterministic_and_distinct() {
+        // Same account + session → identical output on repeated calls (cache-hit guarantee)
+        let s1 = isolate_session_for_account("acc-123", "raw-uuid-abc");
+        let s2 = isolate_session_for_account("acc-123", "raw-uuid-abc");
+        assert_eq!(s1, s2, "must be deterministic for same account+session");
+
+        // Output has the sess_ prefix
+        assert!(s1.starts_with("sess_"), "must start with sess_");
+        // 24 hex chars after prefix
+        assert_eq!(s1.len(), "sess_".len() + 24);
+
+        // Different account_id → different output (no cross-account correlation)
+        let s3 = isolate_session_for_account("acc-456", "raw-uuid-abc");
+        assert_ne!(
+            s1, s3,
+            "different accounts must produce distinct session tokens"
+        );
+
+        // Different raw_session → different output
+        let s4 = isolate_session_for_account("acc-123", "raw-uuid-xyz");
+        assert_ne!(s1, s4, "different raw_session must produce distinct token");
+    }
+
+    #[test]
+    fn test_isolate_session_in_body_top_level_and_request_envelope() {
+        let account_id = "acc-test-789";
+        let raw = "orig-session-uuid";
+
+        let mut body = json!({
+            "sessionId": raw,
+            "model": "gemini-4-carbon-medium",
+            "request": {
+                "sessionId": raw,
+                "contents": []
+            }
+        });
+        isolate_session_in_body(&mut body, account_id);
+
+        let top_sess = body["sessionId"].as_str().unwrap();
+        let req_sess = body["request"]["sessionId"].as_str().unwrap();
+        let expected = isolate_session_for_account(account_id, raw);
+
+        assert_eq!(top_sess, expected, "top-level sessionId must be rewritten");
+        assert_eq!(req_sess, expected, "request.sessionId must be rewritten");
+
+        // Model untouched
+        assert_eq!(body["model"].as_str().unwrap(), "gemini-4-carbon-medium");
+
+        // Idempotent: rewriting the already-hashed value with same account gives a NEW hash,
+        // but the second rewrite uses the hashed value as raw_session, which is fine since
+        // in production the body is cloned fresh for every attempt from body_json.
+    }
+
+    #[test]
+    fn test_isolate_session_in_body_snake_case_field() {
+        let account_id = "acc-snake";
+        let raw = "snake-session-id-orig";
+        let mut body = json!({ "session_id": raw, "request": { "session_id": raw } });
+        isolate_session_in_body(&mut body, account_id);
+        let expected = isolate_session_for_account(account_id, raw);
+        assert_eq!(body["session_id"].as_str().unwrap(), expected);
+        assert_eq!(body["request"]["session_id"].as_str().unwrap(), expected);
+    }
+
+    #[test]
+    fn test_collect_extra_headers_scrubs_correlation_headers() {
+        use axum::http::HeaderMap;
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("x-client-data", "some-chrome-data".parse().unwrap());
+        hdrs.insert(
+            "x-goog-request-params",
+            "project=native-proj".parse().unwrap(),
+        );
+        hdrs.insert("x-vscode-machineid", "machine-abc123".parse().unwrap());
+        hdrs.insert("x-machine-id", "another-id".parse().unwrap());
+        hdrs.insert("x-session-id", "sess-raw-1234".parse().unwrap());
+        hdrs.insert("authorization", "Bearer tok".parse().unwrap());
+        hdrs.insert("x-custom-header", "keep-me".parse().unwrap());
+
+        let out = collect_extra_headers(&hdrs);
+
+        // Stripped headers
+        assert!(
+            !out.contains_key("x-client-data"),
+            "x-client-data must be stripped"
+        );
+        assert!(
+            !out.contains_key("x-goog-request-params"),
+            "x-goog-request-params must be stripped"
+        );
+        assert!(
+            !out.contains_key("x-vscode-machineid"),
+            "x-vscode-machineid must be stripped"
+        );
+        assert!(
+            !out.contains_key("x-machine-id"),
+            "x-machine-id must be stripped"
+        );
+        assert!(
+            !out.contains_key("authorization"),
+            "authorization must be stripped"
+        );
+
+        // Session header passes through (isolate_session_headers rewrites it later per-account)
+        assert!(
+            out.contains_key("x-session-id"),
+            "x-session-id must pass through collect_extra_headers"
+        );
+
+        // Custom headers retained
+        assert_eq!(
+            out.get("x-custom-header").map(|s| s.as_str()),
+            Some("keep-me")
+        );
+    }
+
+    #[test]
+    fn test_isolate_session_headers_rewrites_session_header_per_account() {
+        let raw_session = "raw-session-9999";
+        let account_id = "acc-rewrite-test";
+
+        let mut hdrs = std::collections::HashMap::new();
+        hdrs.insert("x-session-id".to_string(), raw_session.to_string());
+        hdrs.insert("x-vscode-sessionid".to_string(), raw_session.to_string());
+        hdrs.insert("x-custom".to_string(), "untouched".to_string());
+
+        isolate_session_headers(&mut hdrs, account_id);
+
+        let expected = isolate_session_for_account(account_id, raw_session);
+        assert_eq!(
+            hdrs.get("x-session-id").map(|s| s.as_str()),
+            Some(expected.as_str()),
+            "x-session-id must be rewritten to per-account hash"
+        );
+        assert_eq!(
+            hdrs.get("x-vscode-sessionid").map(|s| s.as_str()),
+            Some(expected.as_str()),
+            "x-vscode-sessionid must be rewritten to per-account hash"
+        );
+        // Non-session headers untouched
+        assert_eq!(hdrs.get("x-custom").map(|s| s.as_str()), Some("untouched"));
+    }
+
+    #[test]
+    fn test_gemini_basic_slot_lifecycle_in_hub() {
+        let hub = AsarTelemetryHub::new();
+
+        // Initially no basic slot
+        assert!(hub.get_gemini_basic_slot().is_none());
+
+        // Set basic slot
+        hub.set_gemini_basic_slot("acc-basic-1".to_string(), "basic1@example.com".to_string());
+        assert_eq!(
+            hub.get_gemini_basic_slot().map(|(id, _)| id).as_deref(),
+            Some("acc-basic-1")
+        );
+
+        // clear_gemini_basic_slot_if_matches with wrong id → no change
+        hub.clear_gemini_basic_slot_if_matches("acc-basic-99");
+        assert!(hub.get_gemini_basic_slot().is_some());
+
+        // clear_gemini_basic_slot_if_matches with correct id → cleared
+        hub.clear_gemini_basic_slot_if_matches("acc-basic-1");
+        assert!(hub.get_gemini_basic_slot().is_none());
+
+        // reset_slots() clears all three slots at once
+        hub.set_gemini_basic_slot("acc-basic-2".to_string(), "b2@x.com".to_string());
+        if let Ok(mut g) = hub.claude_slot.write() {
+            *g = Some(("acc-claude".to_string(), "c@x.com".to_string()));
+        }
+        if let Ok(mut g) = hub.gemini_slot.write() {
+            *g = Some(("acc-full".to_string(), "f@x.com".to_string()));
+        }
+        hub.reset_slots();
+        assert!(hub.get_slot(true).is_none(), "claude_slot must be cleared");
+        assert!(hub.get_slot(false).is_none(), "gemini_slot must be cleared");
+        assert!(
+            hub.get_gemini_basic_slot().is_none(),
+            "gemini_basic_slot must be cleared"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_gemini_slot_fallback_to_basic() {
+        let hub = AsarTelemetryHub::new();
+
+        // gemini_slot empty, gemini_basic_slot set → snapshot should fall back to basic
+        hub.set_gemini_basic_slot("acc-b".to_string(), "b@x.com".to_string());
+        // Simulate what snapshot_asar_telemetry does for the gemini_slot field:
+        let gemini_slot_for_snapshot = hub.get_slot(false).or_else(|| hub.get_gemini_basic_slot());
+        assert_eq!(
+            gemini_slot_for_snapshot.as_ref().map(|(id, _)| id.as_str()),
+            Some("acc-b"),
+            "snapshot gemini_slot must fall back to gemini_basic_slot when gemini_slot is empty"
+        );
+
+        // gemini_slot set → gemini_slot wins
+        hub.set_slot(false, "acc-full".to_string(), "full@x.com".to_string());
+        let gemini_slot_for_snapshot2 = hub.get_slot(false).or_else(|| hub.get_gemini_basic_slot());
+        assert_eq!(
+            gemini_slot_for_snapshot2
+                .as_ref()
+                .map(|(id, _)| id.as_str()),
+            Some("acc-full"),
+            "snapshot gemini_slot must prefer gemini_slot over gemini_basic_slot"
+        );
+    }
+
+    #[test]
+    fn test_gemini_pro_orchestrator_fallback() {
+        // Explicitly verify #139 mapping is present
+        assert_eq!(
+            resolve_equivalent_fallback_model("gemini-pro-orchestrator").as_deref(),
+            Some("gemini-4-hydrogen-high")
+        );
+        assert_eq!(
+            resolve_equivalent_fallback_model("gemini-pro-orchestrator-v2").as_deref(),
+            Some("gemini-4-hydrogen-high")
+        );
+        assert_eq!(
+            resolve_equivalent_fallback_model("models/gemini-pro-orchestrator-argon").as_deref(),
+            Some("gemini-4-hydrogen-high")
+        );
     }
 }

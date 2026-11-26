@@ -40,6 +40,7 @@ import {
     saveCatalogModels,
     setAsarBridgePort,
     setAsarDualTrack,
+    setAsarEquivalentFallback,
     startAsarBridge,
     stopAsarBridge,
     syncCatalogFromAccounts,
@@ -172,6 +173,24 @@ export default function AsarBridgePanel() {
                     : t('proxy.asar.dual_track_off', {
                           defaultValue: 'Dual-Track disabled',
                       }),
+                'success',
+            );
+        } catch (error) {
+            showToast(String(error), 'error');
+        } finally {
+            setActionLoading(null);
+        }
+    };
+
+    const handleToggleEquivalentFallback = async (enabled: boolean) => {
+        setActionLoading('equiv-fallback');
+        try {
+            const snap = await setAsarEquivalentFallback(enabled);
+            setTelemetry(snap);
+            showToast(
+                enabled
+                    ? t('proxy.asar.fallback_on', { defaultValue: 'Auto-Fallback enabled' })
+                    : t('proxy.asar.fallback_off', { defaultValue: 'Auto-Fallback disabled' }),
                 'success',
             );
         } catch (error) {
@@ -723,6 +742,41 @@ export default function AsarBridgePanel() {
                             <RotateCcw size={12} />
                             {t('proxy.asar.reset_slots', { defaultValue: 'Reset Slots' })}
                         </button>
+                    )}
+                </div>
+
+                {/* Equivalent Auto-Fallback Bar */}
+                <div className="pt-2.5 border-t border-emerald-200/60 dark:border-emerald-900/40 flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex flex-col gap-0.5 min-w-0">
+                        <label className="inline-flex items-center gap-2 cursor-pointer select-none">
+                            <input
+                                type="checkbox"
+                                className="toggle toggle-xs toggle-success"
+                                checked={telemetry?.equivalent_fallback_enabled ?? true}
+                                disabled={actionLoading === 'equiv-fallback'}
+                                onChange={(e) => handleToggleEquivalentFallback(e.target.checked)}
+                            />
+                            <span className="text-xs font-semibold text-gray-800 dark:text-gray-200">
+                                {t('proxy.asar.fallback_label', {
+                                    defaultValue: 'Auto-Fallback (Cứu hộ khi hết nick Full)',
+                                })}
+                            </span>
+                        </label>
+                        <p className="text-[11px] text-gray-500 dark:text-gray-400 pl-9">
+                            {t('proxy.asar.fallback_desc', {
+                                defaultValue:
+                                    'Khi hết sạch nick có Carbon / Neon / Claude 5.5, tự chạy đỡ lượt đó qua Hydrogen / Claude 4.6 mà không làm tụt model trên IDE',
+                            })}
+                        </p>
+                    </div>
+                    {(telemetry?.fallback_downgrade_count ?? 0) > 0 && (
+                        <span
+                            className="px-2 py-0.5 rounded-md bg-amber-100/80 dark:bg-amber-950/50 text-amber-800 dark:text-amber-300 border border-amber-300/60 dark:border-amber-800/60 text-[11px] font-medium"
+                            title={telemetry?.last_fallback_route ?? ''}
+                        >
+                            ↘ {telemetry?.fallback_downgrade_count}×{' '}
+                            <span className="font-mono font-bold">{telemetry?.last_fallback_route ?? ''}</span>
+                        </span>
                     )}
                 </div>
             </div>

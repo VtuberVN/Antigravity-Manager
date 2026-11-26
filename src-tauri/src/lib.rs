@@ -1108,6 +1108,7 @@ pub fn run() {
             commands::asar::get_catalog_path,
             commands::asar::get_asar_telemetry,
             commands::asar::set_asar_dual_track,
+            commands::asar::set_asar_equivalent_fallback,
             commands::asar::reset_asar_slots,
         ])
         .build(tauri::generate_context!())

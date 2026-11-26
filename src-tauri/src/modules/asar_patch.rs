@@ -20,9 +20,34 @@ static BRIDGE_PORT: AtomicU16 = AtomicU16::new(DEFAULT_BRIDGE_PORT);
 static BRIDGE_PORT_LOADED: AtomicBool = AtomicBool::new(false);
 static HEARTBEAT_FILE: Lazy<Mutex<Option<File>>> = Lazy::new(|| Mutex::new(None));
 
+fn default_bridge_flag_true() -> bool {
+    true
+}
+
+fn default_bridge_port_value() -> u16 {
+    DEFAULT_BRIDGE_PORT
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AsarBridgeConfig {
+    #[serde(default = "default_bridge_port_value")]
     pub port: u16,
+    /// Dual-Track (`Claude Lead` / `Gemini Worker`) slot pinning toggle, persisted across restarts.
+    #[serde(default = "default_bridge_flag_true")]
+    pub dual_track_enabled: bool,
+    /// Graceful Equivalent Model Fallback (Carbon/Neon/Argon -> Hydrogen, Claude 5.5 -> 4.6) toggle.
+    #[serde(default = "default_bridge_flag_true")]
+    pub equivalent_fallback_enabled: bool,
+}
+
+impl Default for AsarBridgeConfig {
+    fn default() -> Self {
+        Self {
+            port: DEFAULT_BRIDGE_PORT,
+            dual_track_enabled: true,
+            equivalent_fallback_enabled: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,18 +98,57 @@ pub fn set_asar_bridge_port(port: u16) -> Result<u16, String> {
     BRIDGE_PORT.store(port, Ordering::SeqCst);
     BRIDGE_PORT_LOADED.store(true, Ordering::SeqCst);
 
+    let mut cfg = load_bridge_config();
+    cfg.port = port;
+    save_bridge_config(&cfg)?;
+
+    info!("ASAR bridge port updated to {}", port);
+    Ok(port)
+}
+
+fn load_bridge_config() -> AsarBridgeConfig {
+    bridge_config_path()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|content| serde_json::from_str::<AsarBridgeConfig>(&content).ok())
+        .unwrap_or_default()
+}
+
+fn save_bridge_config(cfg: &AsarBridgeConfig) -> Result<(), String> {
     if let Some(path) = bridge_config_path() {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let cfg = AsarBridgeConfig { port };
-        let json = serde_json::to_string_pretty(&cfg)
+        let json = serde_json::to_string_pretty(cfg)
             .map_err(|e| format!("Failed to serialize bridge config: {}", e))?;
         fs::write(&path, json).map_err(|e| format!("Failed to write bridge config: {}", e))?;
     }
+    Ok(())
+}
 
-    info!("ASAR bridge port updated to {}", port);
-    Ok(port)
+/// Persisted bridge toggles `(dual_track_enabled, equivalent_fallback_enabled)`; both default to `true`.
+pub fn get_bridge_flags() -> (bool, bool) {
+    let cfg = load_bridge_config();
+    (cfg.dual_track_enabled, cfg.equivalent_fallback_enabled)
+}
+
+/// Persist the Dual-Track toggle without touching other bridge settings.
+pub fn persist_dual_track_flag(enabled: bool) -> Result<(), String> {
+    let mut cfg = load_bridge_config();
+    if cfg.dual_track_enabled == enabled {
+        return Ok(());
+    }
+    cfg.dual_track_enabled = enabled;
+    save_bridge_config(&cfg)
+}
+
+/// Persist the Equivalent Model Fallback toggle without touching other bridge settings.
+pub fn persist_equivalent_fallback_flag(enabled: bool) -> Result<(), String> {
+    let mut cfg = load_bridge_config();
+    if cfg.equivalent_fallback_enabled == enabled {
+        return Ok(());
+    }
+    cfg.equivalent_fallback_enabled = enabled;
+    save_bridge_config(&cfg)
 }
 
 /// Auto-detects all installed Antigravity / Antigravity IDE `resources/app.asar` paths.

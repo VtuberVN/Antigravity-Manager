@@ -17,7 +17,7 @@ import AccountSwitchMenu from './AccountSwitchMenu';
 import { QoSStatusBadge } from './QoSStatusBadge';
 import { getLiveLimitForModel } from '../../utils/liveLimit';
 import { getGroupQuotaSummaries } from '../../utils/quotaDisplay';
-import { extractAccountVerificationUrl, isAccountNeedsVerification, isValidationBlockActive, openVerificationUrl } from '../../utils/accountStatus';
+import { extractAccountVerificationUrl, getAccountDisplayModels, getMissingPoolModels, isAccountNeedsVerification, isFullCapabilityAccount, isValidationBlockActive, openVerificationUrl } from '../../utils/accountStatus';
 import { parseTags } from '../../utils/tagUtils';
 import { extractGemini4Codename, isFlagshipModel } from '../../utils/modelCategory';
 import AccountActionsModal from './AccountActionsModal';
@@ -52,6 +52,13 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, ac
     const isBanned = Boolean(account.banned);
     const isValidationBlocked = isValidationBlockActive(account);
     const needsVerify = isAccountNeedsVerification(account);
+    const poolAccounts = useAccountStore((s) => s.accounts);
+    const isFull = useMemo(() => isFullCapabilityAccount(account, poolAccounts), [account, poolAccounts]);
+    const displayModelCount = useMemo(() => getAccountDisplayModels(account).length, [account]);
+    const missingModels = useMemo(
+        () => (isFull ? [] : getMissingPoolModels(account, poolAccounts)),
+        [account, poolAccounts, isFull]
+    );
     const verifyUrl = useMemo(
         () => (needsVerify ? extractAccountVerificationUrl(account) : null),
         [account, needsVerify]
@@ -355,6 +362,27 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, ac
                         </div>
 
                         <div className="flex items-center gap-1.5 flex-wrap w-full">
+                            {!isBanned && account.quota?.models && account.quota.models.length > 0 && (
+                                isFull ? (
+                                    <button
+                                        type="button"
+                                        onClick={(e) => { e.stopPropagation(); onViewDetails(); }}
+                                        className="px-1.5 py-0.5 rounded-md bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300 text-[9px] font-bold border border-purple-200/60 dark:border-purple-800/50 cursor-pointer hover:brightness-95"
+                                        title={`Full: ${displayModelCount} models — được ưu tiên cho các lượt nặng. Bấm để xem chi tiết`}
+                                    >
+                                        ✨ Full
+                                    </button>
+                                ) : (
+                                    <button
+                                        type="button"
+                                        onClick={(e) => { e.stopPropagation(); onViewDetails(); }}
+                                        className="px-1.5 py-0.5 rounded-md bg-sky-50 dark:bg-sky-900/30 text-sky-700 dark:text-sky-300 text-[9px] font-bold border border-sky-200/60 dark:border-sky-800/50 cursor-pointer hover:brightness-95"
+                                        title={`Basic: ${displayModelCount} models${missingModels.length ? ` — thiếu: ${missingModels.join(', ')}` : ''}. Tự động ưu tiên cho lượt nhẹ để tiết kiệm nick Full. Bấm để xem chi tiết`}
+                                    >
+                                        🔹 Basic
+                                    </button>
+                                )
+                            )}
                             {/* 订阅类型徽章 */}
                             {(() => {
                                 const tier = getAccountTier(account);
