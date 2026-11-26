@@ -7,12 +7,17 @@
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
+use dashmap::{DashMap, DashSet};
+use once_cell::sync::Lazy;
+
 use crate::modules::{config, logger};
 
 /// 启动后给账号索引加载留出的短暂等待
 const INITIAL_STARTUP_DELAY: Duration = Duration::from_secs(5);
 /// 调度器状态检测轮询步长（秒）
 const POLL_INTERVAL_SECS: u64 = 10;
+/// 单轮优先刷新最多处理的活跃脏账号数量，防止突发并发
+const MAX_ACTIVE_REFRESH_BATCH: usize = 3;
 
 /// 单进程只允许启动一次后台定时器
 static AUTO_REFRESH_STARTED: AtomicBool = AtomicBool::new(false);
@@ -20,6 +25,63 @@ static AUTO_REFRESH_STARTED: AtomicBool = AtomicBool::new(false);
 static LAST_REFRESH_TIMESTAMP: AtomicI64 = AtomicI64::new(0);
 /// 标识当前是否有全量刷新任务正在执行中，防止慢速网络下多轮任务重叠并发
 static IS_REFRESHING: AtomicBool = AtomicBool::new(false);
+/// 标识当前是否有活跃账号轻量配额刷新任务在执行中
+static IS_ACTIVE_REFRESHING: AtomicBool = AtomicBool::new(false);
+/// 刚产生过真实请求（ASAR `:8989` 或网关 `:8045`）但尚未同步最新配额的账号集合（存 email 或 account_id，小写归一化）
+static DIRTY_ACTIVE_ACCOUNTS: Lazy<DashSet<String>> = Lazy::new(DashSet::new);
+/// 每个账号（按 account_id）上次执行活跃优先刷新的时间戳（秒）
+static LAST_ACTIVE_REFRESH: Lazy<DashMap<String, i64>> = Lazy::new(DashMap::new);
+
+/// 标记指定账号（email 或 account_id）刚发生真实流量，等待后台优先轻量刷新配额。
+/// 零阻塞内存写入；若用户空闲无请求则集合为空，后台 0 网络开销。
+pub fn mark_account_quota_dirty(account_email_or_id: &str) {
+    let normalized = account_email_or_id.trim().to_ascii_lowercase();
+    if !normalized.is_empty() {
+        DIRTY_ACTIVE_ACCOUNTS.insert(normalized);
+    }
+}
+
+/// 判断单个脏活跃账号在当前时间点是否满足优先轻量刷新条件（纯函数，便于单测验证）
+pub fn should_trigger_active_refresh(
+    active_refresh_enabled: bool,
+    interval_secs: u64,
+    now_ts: i64,
+    last_active_ts: Option<i64>,
+    currently_full_refreshing: bool,
+) -> bool {
+    if !active_refresh_enabled || currently_full_refreshing {
+        return false;
+    }
+    let clamped_interval = interval_secs.clamp(30, 900) as i64;
+    match last_active_ts {
+        None => true,
+        Some(last) => {
+            if last > now_ts {
+                return true;
+            }
+            now_ts.saturating_sub(last) >= clamped_interval
+        }
+    }
+}
+
+struct ActiveRefreshGuard;
+
+impl Drop for ActiveRefreshGuard {
+    fn drop(&mut self) {
+        IS_ACTIVE_REFRESHING.store(false, Ordering::SeqCst);
+    }
+}
+
+fn try_acquire_active_refresh_lock() -> Option<ActiveRefreshGuard> {
+    if IS_ACTIVE_REFRESHING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        Some(ActiveRefreshGuard)
+    } else {
+        None
+    }
+}
 
 /// 记录全量配额刷新的最新时间戳（无论由启动刷新、手动触发还是后台定时触发）
 pub fn record_refresh_timestamp(ts: i64) {
@@ -190,6 +252,100 @@ pub fn start_auto_refresh(
                             }
                         }
                     });
+                    continue;
+                }
+            }
+
+            // 活跃账号优先轻量配额刷新（空闲 0 请求时零磁盘与零网络开销；仅拉轻量配额，绝不发 generateContent 探针）
+            if app_config.active_quota_refresh
+                && !is_refreshing()
+                && !DIRTY_ACTIVE_ACCOUNTS.is_empty()
+            {
+                let dirty_snapshot: Vec<String> =
+                    DIRTY_ACTIVE_ACCOUNTS.iter().map(|r| r.clone()).collect();
+                if let Ok(all_accounts) = crate::modules::list_accounts() {
+                    let mut candidates: Vec<crate::models::Account> = Vec::new();
+                    for key in &dirty_snapshot {
+                        let matched = all_accounts.iter().find(|a| {
+                            a.id.eq_ignore_ascii_case(key) || a.email.eq_ignore_ascii_case(key)
+                        });
+                        let Some(acc) = matched else {
+                            DIRTY_ACTIVE_ACCOUNTS.remove(key);
+                            continue;
+                        };
+
+                        if acc.banned || acc.disabled || acc.is_validation_block_active(now) {
+                            DIRTY_ACTIVE_ACCOUNTS.remove(key);
+                            DIRTY_ACTIVE_ACCOUNTS.remove(&acc.id.to_ascii_lowercase());
+                            DIRTY_ACTIVE_ACCOUNTS.remove(&acc.email.to_ascii_lowercase());
+                            continue;
+                        }
+
+                        let last_active_ts = LAST_ACTIVE_REFRESH.get(&acc.id).map(|v| *v);
+                        if should_trigger_active_refresh(
+                            true,
+                            app_config.active_quota_refresh_interval_secs,
+                            now,
+                            last_active_ts,
+                            false,
+                        ) && !candidates.iter().any(|c| c.id == acc.id)
+                        {
+                            candidates.push(acc.clone());
+                            if candidates.len() >= MAX_ACTIVE_REFRESH_BATCH {
+                                break;
+                            }
+                        }
+                    }
+
+                    if !candidates.is_empty() {
+                        if let Some(active_guard) = try_acquire_active_refresh_lock() {
+                            for acc in &candidates {
+                                DIRTY_ACTIVE_ACCOUNTS.remove(&acc.id.to_ascii_lowercase());
+                                DIRTY_ACTIVE_ACCOUNTS.remove(&acc.email.to_ascii_lowercase());
+                                LAST_ACTIVE_REFRESH.insert(acc.id.clone(), now);
+                            }
+
+                            let state_clone = proxy_state.clone();
+                            let handle_clone = app_handle.clone();
+                            tokio::spawn(async move {
+                                let _guard = active_guard;
+                                let mut any_updated = false;
+                                for mut acc in candidates {
+                                    // 关键：使用轻量级 `fetch_quota_with_retry` (`force_probe = false`)，不额外发送 generateContent 探针
+                                    match crate::modules::account::fetch_quota_with_retry(&mut acc)
+                                        .await
+                                    {
+                                        Ok(quota) => {
+                                            if crate::modules::update_account_quota(&acc.id, quota)
+                                                .is_ok()
+                                            {
+                                                for tm in state_clone.active_token_managers().await
+                                                {
+                                                    let _ = tm.reload_account(&acc.id).await;
+                                                }
+                                                any_updated = true;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            logger::log_warn(&format!(
+                                                "[AutoRefresh] Active-account fast quota refresh skipped for {}: {}",
+                                                acc.email, e
+                                            ));
+                                        }
+                                    }
+                                }
+
+                                if any_updated {
+                                    if let Some(ref handle) = handle_clone {
+                                        use tauri::Emitter;
+                                        crate::modules::tray::update_tray_menus(handle);
+                                        let _ = handle.emit("accounts://refreshed", ());
+                                    }
+                                    crate::modules::log_bridge::emit_accounts_refreshed();
+                                }
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -205,6 +361,69 @@ mod tests {
         let now = 10000;
         let last = 9000; // 1000s ago
         assert!(!should_trigger_auto_refresh(false, 15, now, last, false));
+    }
+
+    #[test]
+    fn test_active_quota_refresh_dirty_queue_and_interval_clamping() {
+        DIRTY_ACTIVE_ACCOUNTS.clear();
+        mark_account_quota_dirty("  User.One@Gmail.com ");
+        mark_account_quota_dirty("");
+        assert!(DIRTY_ACTIVE_ACCOUNTS.contains("user.one@gmail.com"));
+        assert_eq!(DIRTY_ACTIVE_ACCOUNTS.len(), 1);
+        DIRTY_ACTIVE_ACCOUNTS.clear();
+
+        // Disabled or full refresh in progress -> false
+        assert!(!should_trigger_active_refresh(false, 90, 1000, None, false));
+        assert!(!should_trigger_active_refresh(true, 90, 1000, None, true));
+
+        // Never refreshed before -> true
+        assert!(should_trigger_active_refresh(true, 90, 1000, None, false));
+
+        // Respects 90s default interval
+        assert!(!should_trigger_active_refresh(
+            true,
+            90,
+            1000,
+            Some(911),
+            false
+        ));
+        assert!(should_trigger_active_refresh(
+            true,
+            90,
+            1000,
+            Some(910),
+            false
+        ));
+
+        // Clamps minimum interval to 30s and maximum to 900s
+        assert!(!should_trigger_active_refresh(
+            true,
+            5,
+            1000,
+            Some(975),
+            false
+        ));
+        assert!(should_trigger_active_refresh(
+            true,
+            5,
+            1000,
+            Some(970),
+            false
+        ));
+        assert!(!should_trigger_active_refresh(
+            true,
+            5000,
+            2000,
+            Some(1101),
+            false
+        ));
+        assert!(should_trigger_active_refresh(
+            true,
+            5000,
+            2000,
+            Some(1100),
+            false
+        ));
     }
 
     #[test]

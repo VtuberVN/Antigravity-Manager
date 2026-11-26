@@ -61,7 +61,7 @@ import { copyToClipboard } from '../../utils/clipboard';
 import AccountSwitchMenu from './AccountSwitchMenu';
 import { QoSStatusBadge } from './QoSStatusBadge';
 import { getLiveLimitForModel } from '../../utils/liveLimit';
-import { isValidationBlockActive } from '../../utils/accountStatus';
+import { extractAccountVerificationUrl, isAccountNeedsVerification, isValidationBlockActive, openVerificationUrl } from '../../utils/accountStatus';
 import { parseTags } from '../../utils/tagUtils';
 import { isFlagshipModel, extractGemini4Codename } from '../../utils/modelCategory';
 import AccountActionsModal from './AccountActionsModal';
@@ -332,6 +332,8 @@ function AccountRowContent({
     const { active: isPedalActive, targetAccountIds } = usePedalModeStore();
     const isPedaling = isPedalActive && targetAccountIds.includes(account.id);
     const isValidationBlocked = isValidationBlockActive(account);
+    const needsVerify = isAccountNeedsVerification(account);
+    const verifyUrl = needsVerify ? extractAccountVerificationUrl(account) : null;
     const validationBlockedLabel = getValidationBlockedStatusLabel(account.validation_blocked_reason, t);
     const isBanned = Boolean(account.banned);
 
@@ -561,13 +563,36 @@ function AccountRowContent({
                             </span>
                         )}
 
-                        {account.quota?.is_forbidden && !isBanned && (
+                        {account.quota?.is_forbidden && !isBanned && !needsVerify && (
                             <span className="px-2 py-0.5 rounded-md bg-red-100 dark:bg-red-900/50 text-red-600 dark:text-red-400 text-[10px] font-bold flex items-center gap-1 shadow-sm border border-red-200/50">
                                 <Lock className="w-2.5 h-2.5" />
                                 <span>{t('accounts.forbidden')}</span>
                             </span>
                         )}
-                        {isValidationBlocked && (
+                        {needsVerify && (
+                            <>
+                                <span
+                                    className="px-2 py-0.5 rounded-md bg-amber-100 dark:bg-amber-900/50 text-amber-800 dark:text-amber-300 text-[10px] font-bold inline-flex items-center gap-1 shadow-sm border border-amber-300/70 dark:border-amber-700/60"
+                                    title={account.validation_blocked_reason || account.quota?.forbidden_reason || 'Account / Phone verification required'}
+                                >
+                                    <span>📱 Need Verify</span>
+                                </span>
+                                {verifyUrl && (
+                                    <button
+                                        type="button"
+                                        onClick={(e) => {
+                                            e.stopPropagation();
+                                            openVerificationUrl(verifyUrl);
+                                        }}
+                                        className="px-2 py-0.5 rounded-md bg-amber-500 hover:bg-amber-600 text-white text-[10px] font-bold inline-flex items-center gap-0.5 shadow-xs transition-colors cursor-pointer"
+                                        title={verifyUrl}
+                                    >
+                                        <span>{t('accounts.open_verify_url', 'Mở link xác minh ↗')}</span>
+                                    </button>
+                                )}
+                            </>
+                        )}
+                        {isValidationBlocked && !needsVerify && (
                             <span className="px-2 py-0.5 rounded-md bg-amber-100 dark:bg-amber-900/50 text-amber-700 dark:text-amber-400 text-[10px] font-bold flex items-center gap-1 shadow-sm border border-amber-200/50">
                                 <Clock className="w-2.5 h-2.5" />
                                 <span>{validationBlockedLabel}</span>

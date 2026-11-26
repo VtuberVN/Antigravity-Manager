@@ -1,4 +1,5 @@
 import type { Account } from '../types/account';
+import { isTauri } from './env';
 
 /** 验证锁是否仍在有效窗口内；0 / 缺失表示无明确截止时间。 */
 export function isValidationBlockActive(
@@ -27,9 +28,56 @@ export function isAccountNeedsVerification(account: Account): boolean {
         return (
             lower.includes('validation_required') ||
             lower.includes('verify your account') ||
-            lower.includes('validation_url')
+            lower.includes('validation_url') ||
+            lower.includes('further action is required') ||
+            lower.includes('account_verification') ||
+            lower.includes('phone_verification')
         );
     });
+}
+
+/**
+ * 从账号验证原因或字段中提取 Google 验证链接 (https://...)。
+ */
+export function extractAccountVerificationUrl(account: Account): string | null {
+    const candidates = [
+        (account as unknown as { validation_url?: string | null }).validation_url,
+        account.validation_blocked_reason,
+        account.quota?.forbidden_reason,
+        account.proxy_disabled_reason,
+    ];
+
+    const cleanUrl = (rawUrl: string): string => rawUrl.replace(/[.,;)\]}>"']+$/, '');
+
+    for (const raw of candidates) {
+        if (!raw) continue;
+        const taggedMatch = raw.match(/validation_url\s*[:=]\s*(https?:\/\/[^\s"'<>|]+)/i);
+        if (taggedMatch?.[1]) {
+            return cleanUrl(taggedMatch[1]);
+        }
+        const anyUrlMatch = raw.match(/https?:\/\/[^\s"'<>|]+/i);
+        if (anyUrlMatch?.[0]) {
+            return cleanUrl(anyUrlMatch[0]);
+        }
+    }
+    return null;
+}
+
+/**
+ * 在外部浏览器中打开账号验证链接。
+ */
+export async function openVerificationUrl(url: string): Promise<void> {
+    if (!url) return;
+    if (isTauri()) {
+        try {
+            const { openUrl } = await import('@tauri-apps/plugin-opener');
+            await openUrl(url);
+            return;
+        } catch (err) {
+            console.warn('Failed to open verification URL via plugin-opener, falling back:', err);
+        }
+    }
+    window.open(url, '_blank', 'noopener,noreferrer');
 }
 
 /**

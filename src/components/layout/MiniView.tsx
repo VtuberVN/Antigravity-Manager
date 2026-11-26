@@ -33,7 +33,7 @@ import {
     GroupQuotaSummary
 } from '../../utils/quotaDisplay';
 import { getAccountTier, type Account } from '../../types/account';
-import { isAccountAbnormal } from '../../utils/accountStatus';
+import { isAccountAbnormal, isAccountNeedsVerification } from '../../utils/accountStatus';
 import { getLiveLimitForModel } from '../../utils/liveLimit';
 import { isArgonModel } from '../../utils/modelCategory';
 import { GroupQuotaCard } from '../accounts/GroupQuotaCard';
@@ -449,7 +449,13 @@ export default function MiniView() {
 
     const availableAccounts = useMemo(() => {
         return accounts.filter(
-            a => !a.disabled && !a.proxy_disabled && !isAccountAbnormal(a)
+            a => !a.disabled && !a.proxy_disabled && !isAccountAbnormal(a) && !isAccountNeedsVerification(a)
+        );
+    }, [accounts]);
+
+    const switchableAccounts = useMemo(() => {
+        return accounts.filter(
+            a => !a.disabled && !a.banned && !isAccountNeedsVerification(a)
         );
     }, [accounts]);
 
@@ -728,12 +734,17 @@ export default function MiniView() {
 
     return (
         <div className={clsx(
-            "w-full h-full flex flex-col bg-white/95 dark:bg-[#15161a]/95 backdrop-blur-2xl rounded-2xl border border-gray-200/80 dark:border-white/[0.12] overflow-hidden select-none",
-            !isTauri() && "shadow-2xl"
+            "w-full h-full flex flex-col overflow-hidden select-none",
+            isTauri()
+                ? "bg-white dark:bg-[#15161a] rounded-[8px]"
+                : "bg-white/95 dark:bg-[#15161a]/95 backdrop-blur-2xl rounded-2xl border border-gray-200/80 dark:border-white/[0.12] shadow-2xl"
         )}>
             {/* 1. 顶栏：macOS 风格分段 Tab 与快捷工具 */}
             <div
-                className="flex-none flex items-center justify-between gap-1 px-2 py-1.5 bg-gray-50/80 dark:bg-white/[0.03] rounded-t-2xl border-b border-gray-100 dark:border-white/[0.06] select-none cursor-default"
+                className={clsx(
+                    "flex-none flex items-center justify-between gap-1 px-2 py-1.5 bg-gray-50/80 dark:bg-white/[0.03] border-b border-gray-100 dark:border-white/[0.06] select-none cursor-default",
+                    isTauri() ? "rounded-t-[8px]" : "rounded-t-2xl"
+                )}
                 data-tauri-drag-region
                 onMouseDown={(e) => {
                     const target = e.target as HTMLElement;
@@ -1166,7 +1177,7 @@ export default function MiniView() {
                             <span className="text-xs font-semibold text-gray-700 dark:text-gray-300 flex items-center gap-1.5">
                                 <Shuffle className="w-3.5 h-3.5 text-blue-500" />
                                 <span>{t('dashboard.switch_account', '切换当前应用账号')}</span>
-                                <span className="text-[10px] text-gray-400 font-mono">({accounts.length})</span>
+                                <span className="text-[10px] text-gray-400 font-mono">({switchableAccounts.length})</span>
                             </span>
                             <button
                                 onClick={() => setShowAccountList(false)}
@@ -1177,7 +1188,7 @@ export default function MiniView() {
                         </div>
 
                         <div className="flex-1 overflow-y-auto space-y-1 pr-0.5 scrollbar-thin max-h-[200px]">
-                            {accounts.map((acc) => {
+                            {switchableAccounts.map((acc) => {
                                 const isCurrent = acc.id === displayedAccount?.id;
                                 const accTier = getAccountTier(acc);
                                 const isHealthy = !acc.disabled && !isAccountAbnormal(acc);
@@ -1376,7 +1387,10 @@ export default function MiniView() {
 
                 {/* 3. 底部托盘综合控制栏：单行紧凑不折行布局 */}
                 <div
-                    className="flex-none h-10 bg-gray-50/95 dark:bg-black/40 rounded-b-2xl flex items-center justify-between gap-1.5 px-2.5 text-[11px] text-gray-500 dark:text-gray-400 border-t border-gray-100 dark:border-white/[0.06] select-none cursor-default"
+                    className={clsx(
+                        "flex-none h-10 bg-gray-50/95 dark:bg-black/40 flex items-center justify-between gap-1.5 px-2.5 text-[11px] text-gray-500 dark:text-gray-400 border-t border-gray-100 dark:border-white/[0.06] select-none cursor-default",
+                        isTauri() ? "rounded-b-[8px]" : "rounded-b-2xl"
+                    )}
                     data-tauri-drag-region
                     onMouseDown={(e) => {
                         const target = e.target as HTMLElement;

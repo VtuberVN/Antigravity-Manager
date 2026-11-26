@@ -322,6 +322,10 @@ export interface AppConfig {
     theme: string;
     auto_refresh: boolean;
     refresh_interval: number;
+    /** 优先快速刷新刚产生流量的活跃账号配额 */
+    active_quota_refresh?: boolean;
+    /** 活跃账号快速刷新最小间隔（秒），默认 90，范围 30~900 */
+    active_quota_refresh_interval_secs?: number;
     /** 启动完成、账号加载就绪后异步刷新一次全部配额 */
     startup_refresh?: boolean;
     /** 批量配额刷新与启动探测时的同时探测账号数（滑动窗口容量），默认 5，范围 1~20 */

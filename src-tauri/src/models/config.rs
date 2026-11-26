@@ -19,6 +19,12 @@ pub struct AppConfig {
     /// 并发上限固定为 5；0 表示完成后立即让位。
     #[serde(default = "default_refresh_slide_delay_secs")]
     pub refresh_slide_delay_secs: f64,
+    /// 是否开启活跃账号配额优先快速刷新（仅在账号产生真实代理/ASAR 流量后触发轻量刷新）
+    #[serde(default = "default_active_quota_refresh")]
+    pub active_quota_refresh: bool,
+    /// 活跃账号配额快速刷新最小间隔（秒），默认 90，范围 30~900
+    #[serde(default = "default_active_quota_refresh_interval_secs")]
+    pub active_quota_refresh_interval_secs: u64,
     pub auto_sync: bool,
     pub sync_interval: i32, // minutes
     pub default_export_path: Option<String>,
@@ -80,6 +86,14 @@ fn default_refresh_concurrency() -> u32 {
 
 fn default_refresh_slide_delay_secs() -> f64 {
     0.2
+}
+
+fn default_active_quota_refresh() -> bool {
+    true
+}
+
+fn default_active_quota_refresh_interval_secs() -> u64 {
+    90
 }
 
 /// Scheduled warmup configuration
@@ -274,6 +288,8 @@ impl AppConfig {
             startup_refresh: true,
             refresh_concurrency: 5,
             refresh_slide_delay_secs: 0.2,
+            active_quota_refresh: default_active_quota_refresh(),
+            active_quota_refresh_interval_secs: default_active_quota_refresh_interval_secs(),
             auto_sync: false,
             sync_interval: 5,
             default_export_path: None,
@@ -381,5 +397,25 @@ mod tests {
         let saved = serde_json::to_string(&config).unwrap();
         let restored: AppConfig = serde_json::from_str(&saved).unwrap();
         assert_eq!(restored.tray_click_action, "main");
+    }
+
+    #[test]
+    fn active_quota_refresh_defaults_are_backward_compatible() {
+        let config = AppConfig::new();
+        assert!(config.active_quota_refresh);
+        assert_eq!(config.active_quota_refresh_interval_secs, 90);
+
+        let mut value = serde_json::to_value(&config).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("active_quota_refresh");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("active_quota_refresh_interval_secs");
+        let restored: AppConfig = serde_json::from_value(value).unwrap();
+        assert!(restored.active_quota_refresh);
+        assert_eq!(restored.active_quota_refresh_interval_secs, 90);
     }
 }

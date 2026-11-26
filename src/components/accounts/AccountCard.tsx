@@ -17,7 +17,7 @@ import AccountSwitchMenu from './AccountSwitchMenu';
 import { QoSStatusBadge } from './QoSStatusBadge';
 import { getLiveLimitForModel } from '../../utils/liveLimit';
 import { getGroupQuotaSummaries } from '../../utils/quotaDisplay';
-import { isValidationBlockActive } from '../../utils/accountStatus';
+import { extractAccountVerificationUrl, isAccountNeedsVerification, isValidationBlockActive, openVerificationUrl } from '../../utils/accountStatus';
 import { parseTags } from '../../utils/tagUtils';
 import { extractGemini4Codename, isFlagshipModel } from '../../utils/modelCategory';
 import AccountActionsModal from './AccountActionsModal';
@@ -51,6 +51,11 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, ac
     const isDisabled = Boolean(account.disabled);
     const isBanned = Boolean(account.banned);
     const isValidationBlocked = isValidationBlockActive(account);
+    const needsVerify = isAccountNeedsVerification(account);
+    const verifyUrl = useMemo(
+        () => (needsVerify ? extractAccountVerificationUrl(account) : null),
+        [account, needsVerify]
+    );
     const validationBlockedLabel = getValidationBlockedStatusLabel(account.validation_blocked_reason, t);
 
     // Modal states
@@ -180,8 +185,8 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, ac
                             <Trash2 className="w-3.5 h-3.5" />
                         </button>
                     </div>
-                    <div className="flex items-center justify-between w-full gap-2">
-                        <div className="flex items-center gap-1.5 flex-wrap">
+                    <div className="flex flex-col gap-1.5 w-full">
+                        <div className="flex items-center gap-1.5 flex-wrap w-full">
                             {isClassic && (
                                 <span
                                     className="px-1.5 py-0.5 rounded-md bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 text-[9px] font-bold shadow-sm border border-blue-200/50"
@@ -306,13 +311,36 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, ac
                                     {t('accounts.proxy_disabled').toUpperCase()}
                                 </span>
                             )}
-                            {account.quota?.is_forbidden && !isBanned && (
+                            {account.quota?.is_forbidden && !isBanned && !needsVerify && (
                                 <span className="px-1.5 py-0.5 rounded-md bg-red-100 dark:bg-red-900/40 text-red-600 dark:text-red-400 text-[9px] font-bold flex items-center gap-1 shadow-sm border border-red-200/50">
                                     <Lock className="w-2.5 h-2.5" />
                                     {t('accounts.forbidden').toUpperCase()}
                                 </span>
                             )}
-                            {isValidationBlocked && (
+                            {needsVerify && (
+                                <>
+                                    <span
+                                        className="px-1.5 py-0.5 rounded-md bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-300 text-[9px] font-bold inline-flex items-center gap-1 shadow-sm border border-amber-300/70 dark:border-amber-700/60"
+                                        title={account.validation_blocked_reason || account.quota?.forbidden_reason || 'Account / Phone verification required'}
+                                    >
+                                        <span>📱 Need Verify</span>
+                                    </span>
+                                    {verifyUrl && (
+                                        <button
+                                            type="button"
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                openVerificationUrl(verifyUrl);
+                                            }}
+                                            className="px-1.5 py-0.5 rounded-md bg-amber-500 hover:bg-amber-600 text-white text-[9px] font-bold inline-flex items-center gap-0.5 shadow-xs transition-colors cursor-pointer"
+                                            title={verifyUrl}
+                                        >
+                                            <span>{t('accounts.open_verify_url', 'Mở link xác minh ↗')}</span>
+                                        </button>
+                                    )}
+                                </>
+                            )}
+                            {isValidationBlocked && !needsVerify && (
                                 <span className="px-1.5 py-0.5 rounded-md bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-400 text-[9px] font-bold flex items-center gap-1 shadow-sm border border-amber-200/50">
                                     <Clock className="w-2.5 h-2.5" />
                                     {validationBlockedLabel.toUpperCase()}
@@ -324,6 +352,9 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, ac
                                 size="sm"
                                 onRelease={handleReleaseJail}
                             />
+                        </div>
+
+                        <div className="flex items-center gap-1.5 flex-wrap w-full">
                             {/* 订阅类型徽章 */}
                             {(() => {
                                 const tier = getAccountTier(account);
@@ -453,10 +484,10 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, ac
                                     </button>
                                 ))
                             )}
+                            <span className="ml-auto shrink-0 text-[10px] text-gray-400 dark:text-gray-500 font-mono whitespace-nowrap">
+                                {new Date(account.last_used * 1000).toLocaleString([], { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}
+                            </span>
                         </div>
-                        <span className="text-[10px] text-gray-400 dark:text-gray-500 font-mono shrink-0 whitespace-nowrap">
-                            {new Date(account.last_used * 1000).toLocaleString([], { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}
-                        </span>
                     </div>
                 </div>
             </div>
@@ -464,17 +495,33 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, ac
 
             {/* 配额展示 (统一分组展示) */}
             <div className="flex-1 px-1 mb-2 overflow-y-auto scrollbar-none">
-                {isDisabled || account.banned || account.quota?.is_forbidden || isValidationBlocked ? (
-                    <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 h-full py-4 text-center">
+                {isDisabled || account.banned || account.quota?.is_forbidden || isValidationBlocked || needsVerify ? (
+                    <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1.5 h-full py-4 text-center">
                         <div className={cn(
                             "flex items-center gap-1.5",
-                            isValidationBlocked && !account.banned ? "text-amber-600 dark:text-amber-400" : "text-red-600 dark:text-red-400"
+                            (needsVerify || isValidationBlocked) && !account.banned ? "text-amber-600 dark:text-amber-400" : "text-red-600 dark:text-red-400"
                         )}>
-                            {isValidationBlocked && !account.banned ? <Clock className="w-4 h-4" /> : (account.banned ? <Ban className="w-4 h-4" /> : (isDisabled ? <Ban className="w-4 h-4" /> : <Lock className="w-4 h-4" />))}
+                            {(needsVerify || isValidationBlocked) && !account.banned ? <Clock className="w-4 h-4" /> : (account.banned ? <Ban className="w-4 h-4" /> : (isDisabled ? <Ban className="w-4 h-4" /> : <Lock className="w-4 h-4" />))}
                             <span className="text-[11px] font-bold">
-                                {isValidationBlocked && !account.banned ? validationBlockedLabel : (account.banned ? t('accounts.banned_msg', '账号已被上游封禁，已停止自动刷新') : (isDisabled ? t('accounts.status.disabled') : t('accounts.forbidden_msg')))}
+                                {needsVerify && !account.banned
+                                    ? '📱 Tài khoản cần xác minh số điện thoại / bảo mật Google'
+                                    : isValidationBlocked && !account.banned
+                                        ? validationBlockedLabel
+                                        : (account.banned ? t('accounts.banned_msg', '账号已被上游封禁，已停止自动刷新') : (isDisabled ? t('accounts.status.disabled') : t('accounts.forbidden_msg')))}
                             </span>
                         </div>
+                        {needsVerify && verifyUrl && (
+                            <button
+                                type="button"
+                                onClick={(e) => {
+                                    e.stopPropagation();
+                                    openVerificationUrl(verifyUrl);
+                                }}
+                                className="px-2 py-0.5 rounded-md bg-amber-500 hover:bg-amber-600 text-white text-[10px] font-bold transition-colors cursor-pointer"
+                            >
+                                {t('accounts.open_verify_url', 'Mở link xác minh ↗')}
+                            </button>
+                        )}
                         <div className={cn(
                             "w-px h-3 hidden sm:block",
                             isValidationBlocked && !account.banned ? "bg-amber-200 dark:bg-amber-800/50" : "bg-red-200 dark:bg-red-800/50"

@@ -340,6 +340,8 @@ pub(crate) fn classify_lock_reason(reason: &str) -> AccountLockKind {
         || lower.contains("verify your account")
         || lower.contains("validation_url")
         || lower.contains("further action is required")
+        || lower.contains("account_verification")
+        || lower.contains("phone_verification")
     {
         return AccountLockKind::Validation;
     }
@@ -404,6 +406,10 @@ pub(crate) fn clean_model_token(token: &str) -> Option<String> {
 pub(crate) fn forbidden_model_scope(reason: &str) -> Option<String> {
     let lower = reason.to_lowercase();
     if lower.contains("validation_required")
+        || lower.contains("validation_url")
+        || lower.contains("further action is required")
+        || lower.contains("account_verification")
+        || lower.contains("phone_verification")
         || lower.contains("challenge")
         || lower.contains("verify your account")
         || lower.contains("user location")
@@ -712,14 +718,16 @@ impl Account {
     }
 
     /// 验证锁是否仍在有效窗口内。
-    /// - 若有明确截止时间，以 `until > now` 为准；
-    /// - 若 `until == 0` 或缺失（人工验证挑战），在 `last_used` 24 小时内按生效处理，超过 24 小时自动兜底失效防永久死锁。
+    /// - 若 `until == 0`：粘性验证锁（如手机验证 `VALIDATION_REQUIRED`），持续生效直至数据面探针返回 `NotBanned` 或手动解封；
+    /// - 若 `until` 缺失：在 `last_used` 24 小时内按生效处理，超过 24 小时自动兜底失效防永久死锁；
+    /// - 若有明确截止时间（`until > 0`）：以 `until > now` 为准。
     pub fn is_validation_block_active(&self, now: i64) -> bool {
         if !self.validation_blocked {
             return false;
         }
         match self.validation_blocked_until {
-            Some(0) | None => {
+            Some(0) => true,
+            None => {
                 let age = now.saturating_sub(self.last_used);
                 age < 86400
             }

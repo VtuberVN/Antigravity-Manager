@@ -531,6 +531,11 @@ impl ProxyMonitor {
     }
 
     pub async fn log_request(&self, log: ProxyRequestLog) {
+        if let Some(ref account) = log.account_email {
+            if !account.is_empty() && log.protocol.as_deref() != Some("ban_probe") {
+                crate::modules::auto_refresh::mark_account_quota_dirty(account);
+            }
+        }
         if let (Some(account), Some(input), Some(output)) =
             (&log.account_email, log.input_tokens, log.output_tokens)
         {

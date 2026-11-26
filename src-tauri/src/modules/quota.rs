@@ -110,7 +110,7 @@ struct QuotaSummaryBucket {
 }
 
 #[derive(Debug, Deserialize)]
-struct LoadProjectResponse {
+pub(crate) struct LoadProjectResponse {
     #[serde(rename = "cloudaicompanionProject")]
     project_id: Option<String>,
     #[serde(rename = "currentTier")]
@@ -119,16 +119,18 @@ struct LoadProjectResponse {
     paid_tier: Option<Tier>,
     #[serde(rename = "allowedTiers")]
     allowed_tiers: Option<Vec<Tier>>,
-    #[allow(dead_code)]
     #[serde(rename = "ineligibleTiers")]
     ineligible_tiers: Option<Vec<IneligibleTier>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct IneligibleTier {
-    #[allow(dead_code)]
+pub(crate) struct IneligibleTier {
     #[serde(rename = "reasonCode")]
     reason_code: Option<String>,
+    #[serde(rename = "reasonMessage")]
+    reason_message: Option<String>,
+    #[serde(rename = "validationUrl")]
+    validation_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,7 +151,12 @@ struct Tier {
 pub enum BanProbeOutcome {
     /// 数据面推理端点明确返回封禁证据。
     Banned(AccountBanInfo),
-    /// 数据面推理端点返回 2xx：账号当前未被 TOS 封禁。
+    /// 数据面推理端点返回 403 验证挑战（如手机号码验证 `VALIDATION_REQUIRED`）。
+    ValidationRequired {
+        message: String,
+        validation_url: Option<String>,
+    },
+    /// 数据面推理端点返回 2xx：账号当前未被 TOS 封禁且无需人工验证。
     NotBanned,
     /// 网络错误 / 429 / 5xx / 非封禁类 403 等，无法判断（绝不能据此解封）。
     Unknown,
@@ -173,11 +180,120 @@ const BAN_PROBE_ENDPOINTS: [&str; 2] = [
 /// 确保与真实客户端出站报文 100% 结构一致，杜绝因报文残缺/模型废弃被上游 WAF 误限流 (429 RESOURCE_EXHAUSTED)。
 const BAN_PROBE_MODEL: &str = "gemini-3.8-flash-low";
 
-/// 纯函数：把一次探针响应归类为封禁 / 未封禁 / 未知。
+pub(crate) fn is_validation_challenge_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("validation_required")
+        || lower.contains("validation_url")
+        || lower.contains("verify your account")
+        || lower.contains("further action is required")
+        || lower.contains("account_verification")
+        || lower.contains("phone_verification")
+}
+
+pub(crate) fn extract_validation_message_and_url(body: &str) -> (String, Option<String>) {
+    let mut message: Option<String> = None;
+    let mut validation_url: Option<String> = None;
+
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
+        let error = parsed.get("error").unwrap_or(&parsed);
+        if let Some(msg) = error.get("message").and_then(|v| v.as_str()) {
+            let trimmed = msg.trim();
+            if !trimmed.is_empty() {
+                message = Some(trimmed.to_string());
+            }
+        }
+        if let Some(details) = error.get("details").and_then(|v| v.as_array()) {
+            for detail in details {
+                if validation_url.is_none() {
+                    if let Some(url) = detail
+                        .get("metadata")
+                        .and_then(|m| m.get("validation_url"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.trim().is_empty())
+                    {
+                        validation_url = Some(url.trim().to_string());
+                    }
+                }
+            }
+        }
+        if let Some(inner_str) = parsed.get("error").and_then(|v| v.as_str()) {
+            if let Ok(inner_json) = serde_json::from_str::<serde_json::Value>(inner_str) {
+                let inner_err = inner_json.get("error").unwrap_or(&inner_json);
+                if message.is_none() {
+                    if let Some(msg) = inner_err.get("message").and_then(|v| v.as_str()) {
+                        let trimmed = msg.trim();
+                        if !trimmed.is_empty() {
+                            message = Some(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if validation_url.is_none() {
+        validation_url = AccountBanInfo::extract_url_from_text(body);
+    }
+
+    let final_message = message.unwrap_or_else(|| {
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            "Verify your account to continue.".to_string()
+        } else {
+            trimmed.chars().take(600).collect()
+        }
+    });
+
+    (final_message, validation_url)
+}
+
+pub(crate) fn extract_ineligible_validation(
+    data: &LoadProjectResponse,
+) -> Option<(String, Option<String>)> {
+    if data.paid_tier.is_some() || data.current_tier.is_some() {
+        return None;
+    }
+    let tiers = data.ineligible_tiers.as_ref()?;
+    for tier in tiers {
+        let code = tier.reason_code.as_deref().unwrap_or("");
+        let msg = tier.reason_message.as_deref().unwrap_or("");
+        let combined_lower = format!("{} {}", code, msg).to_ascii_lowercase();
+        let has_url = tier
+            .validation_url
+            .as_deref()
+            .is_some_and(|u| !u.trim().is_empty());
+        if has_url
+            || combined_lower.contains("validation")
+            || combined_lower.contains("verify")
+            || combined_lower.contains("phone_verification")
+            || combined_lower.contains("account_verification")
+        {
+            let readable = if !msg.trim().is_empty() {
+                msg.trim().to_string()
+            } else if !code.trim().is_empty() {
+                code.trim().to_string()
+            } else {
+                "Account verification required".to_string()
+            };
+            let url = tier
+                .validation_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| AccountBanInfo::extract_url_from_text(msg));
+            return Some((readable, url));
+        }
+    }
+    None
+}
+
+/// 纯函数：把一次探针响应归类为封禁 / 需要验证 / 未封禁 / 未知。
 ///
 /// 只有「403 + 高置信账号级封禁证据」才算封禁；
+/// 「403 + 验证挑战（手机/人机验证）」归类为 `ValidationRequired`；
 /// 2xx 必须包含真实的 Google 模型响应结构（`candidates`），避免代理拦截页或假 200 误解封；
-/// 验证挑战、区域限制、模型级 403、429、5xx 等一律保持 `Unknown`，避免误伤正常账号。
+/// 区域限制、模型级 403、429、5xx 等一律保持 `Unknown`，避免误伤正常账号。
 pub(crate) fn classify_ban_probe_response(status: u16, body: &str) -> BanProbeOutcome {
     if (200..300).contains(&status) {
         if body.contains("\"candidates\"") {
@@ -189,15 +305,12 @@ pub(crate) fn classify_ban_probe_response(status: u16, body: &str) -> BanProbeOu
         return BanProbeOutcome::Unknown;
     }
 
-    let text_lower = body.to_lowercase();
-    // 验证挑战不是账号封禁，交给配额/代理层的验证锁路径处理。
-    // 否则同一份 403 在“配额刷新”和“代理请求”两条路径上会得到不同结论。
-    if text_lower.contains("validation_required")
-        || text_lower.contains("validation_url")
-        || text_lower.contains("verify your account")
-        || text_lower.contains("further action is required")
-    {
-        return BanProbeOutcome::Unknown;
+    if is_validation_challenge_text(body) {
+        let (message, validation_url) = extract_validation_message_and_url(body);
+        return BanProbeOutcome::ValidationRequired {
+            message,
+            validation_url,
+        };
     }
     // 区域限制 / 模型级权限拒绝不是 TOS 封禁；`classify_upstream` 只认高置信封禁词，
     // 这里不需要额外硬编码关键词。
@@ -290,7 +403,9 @@ pub async fn probe_account_ban(
                 );
                 // 封禁探针为纯后台健康诊断，绝不写入流量日志，保持监控面板清爽纯净
                 match outcome {
-                    BanProbeOutcome::Banned(_) | BanProbeOutcome::NotBanned => return outcome,
+                    BanProbeOutcome::Banned(_)
+                    | BanProbeOutcome::ValidationRequired { .. }
+                    | BanProbeOutcome::NotBanned => return outcome,
                     BanProbeOutcome::Unknown => {
                         last_outcome = outcome;
                         continue;
@@ -338,12 +453,17 @@ const CLOUD_CODE_LOAD_PROJECT_ENDPOINTS: [&str; 3] = [
     "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
 ];
 
-/// Fetch project ID and subscription tier
+/// Fetch project ID, subscription tier, raw tier, and optional `ineligibleTiers` validation challenge
 async fn fetch_project_id(
     access_token: &str,
     email: &str,
     account_id: Option<&str>,
-) -> (Option<String>, Option<String>, Option<String>) {
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<(String, Option<String>)>,
+) {
     let client = create_standard_client(account_id).await;
     let meta = json!({"metadata": {"ideType": "ANTIGRAVITY"}});
     let health_tracker = get_quota_endpoint_health();
@@ -374,6 +494,7 @@ async fn fetch_project_id(
                     health_tracker.mark_success(ep_url);
                     if let Ok(data) = res.json::<LoadProjectResponse>().await {
                         let project_id = data.project_id.clone();
+                        let ineligible_validation = extract_ineligible_validation(&data);
 
                         // 等级提取优先级：
                         // 1. 优先取 paid_tier：若有付费信息（g1-pro-tier / g1-ultra-tier），直接作为权威付费等级；
@@ -428,7 +549,12 @@ async fn fetch_project_id(
                             ));
                         }
 
-                        return (project_id, subscription_tier, Some(raw_tier));
+                        return (
+                            project_id,
+                            subscription_tier,
+                            Some(raw_tier),
+                            ineligible_validation,
+                        );
                     }
                 } else {
                     if crate::proxy::upstream::client::should_try_next_endpoint_for_url(
@@ -454,7 +580,7 @@ async fn fetch_project_id(
         }
     }
 
-    (None, None, None)
+    (None, None, None, None)
 }
 
 /// 解析账号的 project_id（控制面查询，被封禁账号同样会返回 200）。
@@ -498,7 +624,7 @@ pub async fn fetch_quota_with_cache(
     // 这个「优化」只剩副作用，因此移除。
     //
     // 现在：始终调用；仅在上游返回空值时用缓存/已存值兜底，避免网络抖动把数据抹掉。
-    let (fresh_project_id, fresh_tier, fresh_raw_tier) =
+    let (fresh_project_id, fresh_tier, fresh_raw_tier, ineligible_validation) =
         fetch_project_id(access_token, email, account_id).await;
 
     let project_id = fresh_project_id.or_else(|| cached_project_id.map(|s| s.to_string()));
@@ -514,6 +640,24 @@ pub async fn fetch_quota_with_cache(
     // 上游值优先；上游这次没给（网络失败 / 未识别）才保留旧值。
     let subscription_tier = fresh_tier.or(existing_tier);
     let raw_tier = fresh_raw_tier.or(existing_raw_tier);
+
+    if let Some((val_msg, val_url)) = ineligible_validation {
+        let reason_str =
+            crate::modules::account::format_validation_reason(&val_msg, val_url.as_deref());
+        crate::modules::logger::log_warn(&format!(
+            "📱 [{}] loadCodeAssist ineligibleTiers requires account verification: {}",
+            email, reason_str
+        ));
+        if let Some(id) = account_id {
+            let _ = crate::modules::account::mark_account_validation_blocked(id, 0, &reason_str);
+        }
+        let mut q = QuotaData::new();
+        q.is_forbidden = true;
+        q.forbidden_reason = Some(reason_str);
+        q.subscription_tier = subscription_tier;
+        q.raw_tier = raw_tier;
+        return Ok((q, project_id));
+    }
 
     // We keep project_id to store in the DB, but we NO LONGER force inject it into payload if it's absent
 
@@ -570,19 +714,17 @@ pub async fn fetch_quota_with_cache(
 
                         // 智能识别上游返回信息并分类处理
                         if let Some(id) = account_id {
-                            let text_lower = text.to_lowercase();
-                            let is_validation = text_lower.contains("validation_required")
-                                || text_lower.contains("verify your account")
-                                || text_lower.contains("validation_url");
-
-                            if is_validation {
-                                let block_minutes = 10i64;
-                                let block_until =
-                                    chrono::Utc::now().timestamp() + (block_minutes * 60);
+                            if is_validation_challenge_text(&text) {
+                                let (msg, url) = extract_validation_message_and_url(&text);
+                                let reason_str = crate::modules::account::format_validation_reason(
+                                    &msg,
+                                    url.as_deref(),
+                                );
+                                q.forbidden_reason = Some(reason_str.clone());
                                 let _ = crate::modules::account::mark_account_validation_blocked(
                                     id,
-                                    block_until,
-                                    &text,
+                                    0,
+                                    &reason_str,
                                 );
                             } else {
                                 let _ = crate::modules::account::mark_account_forbidden(
@@ -1190,7 +1332,7 @@ pub async fn get_valid_token_for_warmup(
     {
         pid.to_string()
     } else {
-        let (project_id, _, _) = fetch_project_id(
+        let (project_id, _, _, _) = fetch_project_id(
             &account.token.access_token,
             &account.email,
             Some(&account.id),
@@ -1906,9 +2048,8 @@ mod tests {
             BanProbeOutcome::Unknown
         );
 
-        // 验证挑战 / 区域限制 / 模型级权限拒绝一律 Unknown，绝不能据此封号或解封。
+        // 区域限制 / 模型级权限拒绝一律 Unknown，绝不能据此封号或解封。
         for body in [
-            r#"{"error":{"code":403,"message":"validation_required"}}"#,
             r#"{"error":{"code":403,"message":"User location is not supported for the API use."}}"#,
             r#"{"error":{"code":403,"message":"Model not found or not available for this account"}}"#,
             r#"{"error":{"code":403,"message":"Permission denied for model gemini-3-pro"}}"#,
@@ -1916,7 +2057,7 @@ mod tests {
             assert_eq!(
                 classify_ban_probe_response(403, body),
                 BanProbeOutcome::Unknown,
-                "403 without high-confidence TOS evidence must stay Unknown: {body}"
+                "403 without high-confidence TOS or validation evidence must stay Unknown: {body}"
             );
         }
         assert_eq!(
@@ -1930,6 +2071,62 @@ mod tests {
         assert_eq!(
             classify_ban_probe_response(400, "{}"),
             BanProbeOutcome::Unknown
+        );
+    }
+
+    #[test]
+    fn test_ban_probe_classifies_validation_required_and_extracts_url() {
+        let validation_json = r#"{"error":{"code":403,"message":"Verify your account to continue.","status":"PERMISSION_DENIED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"VALIDATION_REQUIRED","domain":"cloudcode-pa.googleapis.com","metadata":{"validation_url":"https://accounts.google.com/signin/continue?sarp=1&scc=1"}}]}}"#;
+        match classify_ban_probe_response(403, validation_json) {
+            BanProbeOutcome::ValidationRequired {
+                message,
+                validation_url,
+            } => {
+                assert_eq!(message, "Verify your account to continue.");
+                assert_eq!(
+                    validation_url.as_deref(),
+                    Some("https://accounts.google.com/signin/continue?sarp=1&scc=1")
+                );
+            }
+            other => panic!("expected ValidationRequired, got {:?}", other),
+        }
+
+        for marker_body in [
+            r#"{"error":{"code":403,"message":"validation_required"}}"#,
+            r#"{"error":{"code":403,"message":"Further action is required to use this service."}}"#,
+            r#"{"error":{"code":403,"message":"PHONE_VERIFICATION required"}}"#,
+            r#"{"error":{"code":403,"message":"ACCOUNT_VERIFICATION challenge"}}"#,
+        ] {
+            assert!(
+                matches!(
+                    classify_ban_probe_response(403, marker_body),
+                    BanProbeOutcome::ValidationRequired { .. }
+                ),
+                "expected ValidationRequired for {marker_body}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_load_code_assist_ineligible_tier_surfaces_validation() {
+        let raw = r#"{
+            "cloudaicompanionProject": null,
+            "currentTier": null,
+            "paidTier": null,
+            "ineligibleTiers": [
+                {
+                    "reasonCode": "VALIDATION_REQUIRED",
+                    "reasonMessage": "Verify your account phone number to continue.",
+                    "validationUrl": "https://accounts.google.com/verify-phone"
+                }
+            ]
+        }"#;
+        let parsed: LoadProjectResponse = serde_json::from_str(raw).unwrap();
+        let extracted = extract_ineligible_validation(&parsed).expect("should detect validation");
+        assert_eq!(extracted.0, "Verify your account phone number to continue.");
+        assert_eq!(
+            extracted.1.as_deref(),
+            Some("https://accounts.google.com/verify-phone")
         );
     }
 

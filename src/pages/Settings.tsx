@@ -52,6 +52,8 @@ function Settings() {
         theme: 'system',
         auto_refresh: false,
         refresh_interval: 10,
+        active_quota_refresh: true,
+        active_quota_refresh_interval_secs: 90,
         startup_refresh: true,
         refresh_concurrency: 5,
         refresh_slide_delay_secs: 0.2,
@@ -1165,6 +1167,201 @@ function Settings() {
                                         />
                                         <div className="w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500 shadow-inner"></div>
                                     </label>
+                                </div>
+
+                                <div className="mt-5 pt-5 border-t border-gray-50 dark:border-base-300 space-y-3 animate-in slide-in-from-top-1 duration-200">
+                                    <div className="flex items-center justify-between gap-4">
+                                        <div className="min-w-0 flex-1">
+                                            <div className="text-sm font-bold text-gray-900 dark:text-gray-100">
+                                                {t('settings.account.active_quota_refresh', {
+                                                    defaultValue: 'Ưu tiên cập nhật nhanh tài khoản đang dùng (Active Account Fast Refresh)',
+                                                })}
+                                            </div>
+                                            <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                                                {t('settings.account.active_quota_refresh_desc', {
+                                                    defaultValue: 'Chỉ làm mới quota nhẹ cho tài khoản vừa phát sinh lưu lượng (ASAR / Proxy), tự nghỉ khi không dùng — không lo bị quét 429.',
+                                                })}
+                                            </p>
+                                        </div>
+                                        <label className="relative inline-flex items-center cursor-pointer shrink-0">
+                                            <input
+                                                type="checkbox"
+                                                className="sr-only peer"
+                                                checked={formData.active_quota_refresh !== false}
+                                                onChange={async (e) => {
+                                                    const enabled = e.target.checked;
+                                                    const newConfig = { ...formData, active_quota_refresh: enabled };
+                                                    setFormData(newConfig);
+                                                    try {
+                                                        await saveConfig(newConfig);
+                                                    } catch (error) {
+                                                        showToast(`${t('common.error')}: ${error}`, 'error');
+                                                    }
+                                                }}
+                                            />
+                                            <div className="w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-500 shadow-inner"></div>
+                                        </label>
+                                    </div>
+
+                                    {formData.active_quota_refresh !== false && (
+                                        <div className="flex flex-wrap items-center gap-2 pt-1">
+                                            <span className="text-[11px] font-bold text-gray-500 dark:text-gray-400 uppercase tracking-wider mr-1">
+                                                {t('settings.account.active_refresh_interval', { defaultValue: 'Chu kỳ tối thiểu:' })}
+                                            </span>
+                                            {[
+                                                { secs: 30, label: '30s' },
+                                                { secs: 60, label: '60s' },
+                                                { secs: 90, label: '90s (Khuyên dùng)' },
+                                                { secs: 120, label: '120s' },
+                                                { secs: 300, label: '300s' },
+                                            ].map((preset) => {
+                                                const currentSecs = formData.active_quota_refresh_interval_secs ?? 90;
+                                                const isSelected = currentSecs === preset.secs;
+                                                return (
+                                                    <button
+                                                        key={preset.secs}
+                                                        type="button"
+                                                        onClick={async () => {
+                                                            const newConfig = {
+                                                                ...formData,
+                                                                active_quota_refresh_interval_secs: preset.secs,
+                                                            };
+                                                            setFormData(newConfig);
+                                                            try {
+                                                                await saveConfig(newConfig);
+                                                            } catch (error) {
+                                                                showToast(`${t('common.error')}: ${error}`, 'error');
+                                                            }
+                                                        }}
+                                                        className={cn(
+                                                            'px-2.5 py-1 rounded-lg text-xs font-semibold border transition-all cursor-pointer',
+                                                            isSelected
+                                                                ? 'bg-emerald-600 text-white border-emerald-600 shadow-xs'
+                                                                : 'bg-gray-50 dark:bg-base-200 text-gray-700 dark:text-gray-300 border-gray-200 dark:border-base-300 hover:bg-gray-100 dark:hover:bg-base-300',
+                                                        )}
+                                                    >
+                                                        {preset.label}
+                                                    </button>
+                                                );
+                                            })}
+                                            <div className="flex items-center gap-1.5 ml-1">
+                                                <input
+                                                    type="number"
+                                                    min="30"
+                                                    max="900"
+                                                    value={formData.active_quota_refresh_interval_secs ?? 90}
+                                                    onChange={(e) => {
+                                                        const parsed = parseInt(e.target.value, 10);
+                                                        setFormData({
+                                                            ...formData,
+                                                            active_quota_refresh_interval_secs: Number.isNaN(parsed)
+                                                                ? 90
+                                                                : Math.min(Math.max(parsed, 30), 900),
+                                                        });
+                                                    }}
+                                                    className="w-20 px-2.5 py-1 bg-gray-50 dark:bg-base-200 border border-gray-200 dark:border-base-300 rounded-lg focus:ring-2 focus:ring-emerald-500 outline-none text-xs font-bold font-mono text-emerald-600 dark:text-emerald-400"
+                                                />
+                                                <span className="text-[11px] text-gray-400">s (30–900s)</span>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+
+                                <div className="mt-5 pt-5 border-t border-gray-50 dark:border-base-300 space-y-3 animate-in slide-in-from-top-1 duration-200">
+                                    <div>
+                                        <div className="text-sm font-bold text-gray-900 dark:text-gray-100">
+                                            {t('settings.account.pool_refresh_limits', {
+                                                defaultValue: 'Giới hạn tốc độ làm mới toàn dàn (All-Accounts Refresh Concurrency & Delay)',
+                                            })}
+                                        </div>
+                                        <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                                            {t('settings.account.pool_refresh_limits_desc', {
+                                                defaultValue: 'Kiểm soát số luồng đồng thời và độ trễ giãn cách khi làm mới toàn bộ danh sách tài khoản.',
+                                            })}
+                                        </p>
+                                    </div>
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-1">
+                                        <div className="p-3 rounded-xl bg-gray-50/80 dark:bg-base-200/70 border border-gray-100 dark:border-base-300 space-y-2">
+                                            <div className="flex items-center justify-between text-xs">
+                                                <span className="font-semibold text-gray-700 dark:text-gray-300">
+                                                    {t('settings.account.refresh_concurrency', { defaultValue: 'Số luồng đồng thời (Concurrency)' })}
+                                                </span>
+                                                <span className="font-mono font-bold text-blue-600 dark:text-blue-400">
+                                                    {Math.min(Math.max(formData.refresh_concurrency ?? 5, 1), 15)}
+                                                </span>
+                                            </div>
+                                            <div className="flex items-center gap-3">
+                                                <input
+                                                    type="range"
+                                                    min="1"
+                                                    max="15"
+                                                    step="1"
+                                                    value={Math.min(Math.max(formData.refresh_concurrency ?? 5, 1), 15)}
+                                                    onChange={(e) => {
+                                                        const val = Math.min(Math.max(parseInt(e.target.value, 10) || 5, 1), 15);
+                                                        setFormData({ ...formData, refresh_concurrency: val });
+                                                    }}
+                                                    className="flex-1 accent-blue-600 cursor-pointer"
+                                                />
+                                                <input
+                                                    type="number"
+                                                    min="1"
+                                                    max="15"
+                                                    value={Math.min(Math.max(formData.refresh_concurrency ?? 5, 1), 15)}
+                                                    onChange={(e) => {
+                                                        const parsed = parseInt(e.target.value, 10);
+                                                        setFormData({
+                                                            ...formData,
+                                                            refresh_concurrency: Number.isNaN(parsed) ? 5 : Math.min(Math.max(parsed, 1), 15),
+                                                        });
+                                                    }}
+                                                    className="w-16 px-2 py-1 bg-white dark:bg-base-100 border border-gray-200 dark:border-base-300 rounded-md text-xs font-bold font-mono text-blue-600 dark:text-blue-400 outline-none"
+                                                />
+                                            </div>
+                                        </div>
+
+                                        <div className="p-3 rounded-xl bg-gray-50/80 dark:bg-base-200/70 border border-gray-100 dark:border-base-300 space-y-2">
+                                            <div className="flex items-center justify-between text-xs">
+                                                <span className="font-semibold text-gray-700 dark:text-gray-300">
+                                                    {t('settings.account.refresh_slide_delay', { defaultValue: 'Độ trễ giãn cách (Slide Delay)' })}
+                                                </span>
+                                                <span className="font-mono font-bold text-blue-600 dark:text-blue-400">
+                                                    {(formData.refresh_slide_delay_secs ?? 0.2).toFixed(1)}s
+                                                </span>
+                                            </div>
+                                            <div className="flex items-center gap-3">
+                                                <input
+                                                    type="range"
+                                                    min="0.1"
+                                                    max="3.0"
+                                                    step="0.1"
+                                                    value={Math.min(Math.max(formData.refresh_slide_delay_secs ?? 0.2, 0.1), 3.0)}
+                                                    onChange={(e) => {
+                                                        const val = Math.round(Math.min(Math.max(parseFloat(e.target.value) || 0.2, 0.1), 3.0) * 10) / 10;
+                                                        setFormData({ ...formData, refresh_slide_delay_secs: val });
+                                                    }}
+                                                    className="flex-1 accent-blue-600 cursor-pointer"
+                                                />
+                                                <input
+                                                    type="number"
+                                                    min="0.1"
+                                                    max="3.0"
+                                                    step="0.1"
+                                                    value={formData.refresh_slide_delay_secs ?? 0.2}
+                                                    onChange={(e) => {
+                                                        const parsed = parseFloat(e.target.value);
+                                                        setFormData({
+                                                            ...formData,
+                                                            refresh_slide_delay_secs: Number.isNaN(parsed)
+                                                                ? 0.2
+                                                                : Math.round(Math.min(Math.max(parsed, 0.1), 3.0) * 10) / 10,
+                                                        });
+                                                    }}
+                                                    className="w-16 px-2 py-1 bg-white dark:bg-base-100 border border-gray-200 dark:border-base-300 rounded-md text-xs font-bold font-mono text-blue-600 dark:text-blue-400 outline-none"
+                                                />
+                                            </div>
+                                        </div>
+                                    </div>
                                 </div>
 
                                 <div className="mt-5 pt-5 border-t border-gray-50 dark:border-base-300 flex items-center gap-4 animate-in slide-in-from-top-1 duration-200">

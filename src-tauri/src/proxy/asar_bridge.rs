@@ -1003,13 +1003,18 @@ async fn handle_v1internal_pool(
                     }
                     Forbidden403Kind::ValidationRequired => {
                         tracing::warn!(
-                            "[ASAR-Bridge] 403 VALIDATION_REQUIRED for {}; marking validation_blocked",
+                            "[ASAR-Bridge] 403 VALIDATION_REQUIRED for {}; marking sticky validation_blocked",
                             email
                         );
-                        let block_until = chrono::Utc::now().timestamp() + 10 * 60;
+                        let extracted_url =
+                            crate::models::AccountBanInfo::extract_url_from_text(&err_body);
+                        let reason_str = crate::modules::account::format_validation_reason(
+                            &err_body,
+                            extracted_url.as_deref(),
+                        );
                         if let Err(e) = state
                             .token_manager
-                            .set_validation_block_public(&account_id, block_until, &err_body)
+                            .set_validation_block_public(&account_id, 0, &reason_str)
                             .await
                         {
                             tracing::error!("[ASAR-Bridge] Failed to set validation block: {}", e);
@@ -1699,6 +1704,9 @@ pub(crate) fn classify_403_error(err_body: &str) -> Forbidden403Kind {
     if upper.contains("VALIDATION_REQUIRED")
         || lower.contains("verify your account")
         || lower.contains("validation_url")
+        || lower.contains("further action is required")
+        || lower.contains("account_verification")
+        || lower.contains("phone_verification")
     {
         return Forbidden403Kind::ValidationRequired;
     }
@@ -1804,6 +1812,9 @@ fn record_bridge_log(
         username: None,
         session_id: session_id.map(str::to_string),
     };
+    if let Some(email) = account_email.filter(|s| !s.is_empty()) {
+        crate::modules::auto_refresh::mark_account_quota_dirty(email);
+    }
     let monitor = state.monitor.clone();
     tokio::spawn(async move {
         monitor.log_request(log).await;

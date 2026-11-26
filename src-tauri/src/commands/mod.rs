@@ -395,7 +395,15 @@ pub async fn refresh_all_quotas_internal(
     proxy_state: &crate::commands::proxy::ProxyServiceState,
     app_handle: Option<tauri::AppHandle>,
 ) -> Result<RefreshStats, String> {
-    let stats = modules::account::refresh_all_quotas_logic().await?;
+    refresh_all_quotas_internal_ext(proxy_state, app_handle, false).await
+}
+
+pub async fn refresh_all_quotas_internal_ext(
+    proxy_state: &crate::commands::proxy::ProxyServiceState,
+    app_handle: Option<tauri::AppHandle>,
+    manual_trigger: bool,
+) -> Result<RefreshStats, String> {
+    let stats = modules::account::refresh_all_quotas_logic_ext(manual_trigger).await?;
 
     // 记录刷新完成时间戳，供后台自动刷新调度器对齐周期 (Fixes #3958)
     modules::auto_refresh::record_refresh_timestamp(chrono::Utc::now().timestamp());
@@ -421,7 +429,7 @@ pub async fn refresh_all_quotas_internal(
     Ok(stats)
 }
 
-/// 刷新所有账号配额 (Tauri Command)
+/// 刷新所有账号配额 (Tauri Command — 显式用户手动触发，立即执行封禁/手机验证探针)
 #[tauri::command]
 pub async fn refresh_all_quotas(
     proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
@@ -433,7 +441,7 @@ pub async fn refresh_all_quotas(
             return Err("A quota refresh task is already in progress, please wait.".to_string());
         }
     };
-    refresh_all_quotas_internal(&proxy_state, Some(app_handle)).await
+    refresh_all_quotas_internal_ext(&proxy_state, Some(app_handle), true).await
 }
 /// 获取设备指纹（当前 storage.json + 账号绑定）
 #[tauri::command]

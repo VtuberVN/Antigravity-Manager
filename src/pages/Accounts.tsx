@@ -2,14 +2,17 @@
 
 import {
   Download,
+  EyeOff,
   LayoutGrid,
   List,
+  RotateCcw,
   Search,
   Sparkles,
   ToggleLeft,
   ToggleRight,
   Trash2,
   Upload,
+  Zap,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import AccountDetailsDialog from "../components/accounts/AccountDetailsDialog";
@@ -28,6 +31,7 @@ import { useAccountStore } from "../stores/useAccountStore";
 import { useConfigStore } from "../stores/useConfigStore";
 import { Account, getAccountTier, ImportAccountEntry } from "../types/account";
 import { isAccountAbnormal, isAccountNeedsVerification } from "../utils/accountStatus";
+import { getGroupQuotaSummaries } from "../utils/quotaDisplay";
 import { cn } from "../utils/cn";
 import { isTauri } from "../utils/env";
 import { request as invoke } from "../utils/request";
@@ -37,6 +41,22 @@ import { useLocation } from "react-router-dom";
 
 type FilterType = "all" | "pro" | "ultra" | "enterprise" | "free" | "abnormal" | "need_verify";
 type ViewMode = "list" | "grid";
+
+interface HideFiltersState {
+  hideGeminiEmpty: boolean;
+  hideClaudeEmpty: boolean;
+  hideNonPaid: boolean;
+  hideNeedVerify: boolean;
+  hideBanned403: boolean;
+}
+
+const DEFAULT_HIDE_FILTERS: HideFiltersState = {
+  hideGeminiEmpty: false,
+  hideClaudeEmpty: false,
+  hideNonPaid: false,
+  hideNeedVerify: false,
+  hideBanned403: false,
+};
 
 
 function Accounts() {
@@ -101,6 +121,23 @@ function Accounts() {
     const saved = localStorage.getItem('accounts_view_mode');
     return (saved === 'list' || saved === 'grid') ? saved : 'list';
   });
+
+  const [hideFilters, setHideFilters] = useState<HideFiltersState>(() => {
+    try {
+      const raw = localStorage.getItem('accounts_hide_filters');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        return { ...DEFAULT_HIDE_FILTERS, ...parsed };
+      }
+    } catch {
+      // Ignore invalid localStorage JSON
+    }
+    return DEFAULT_HIDE_FILTERS;
+  });
+
+  useEffect(() => {
+    localStorage.setItem('accounts_hide_filters', JSON.stringify(hideFilters));
+  }, [hideFilters]);
 
   // Save view mode preference
   useEffect(() => {
@@ -345,13 +382,71 @@ function Accounts() {
     };
   }, [searchedAccounts]);
 
-  // 过滤和搜索最终结果
-  const filteredAccounts = useMemo(() => {
+  // 过滤和搜索基础结果 (Tab 1)
+  const baseFilteredAccounts = useMemo(() => {
     if (filter === "all") return searchedAccounts;
     if (filter === "abnormal") return searchedAccounts.filter(isAccountAbnormal);
     if (filter === "need_verify") return searchedAccounts.filter(isAccountNeedsVerification);
     return searchedAccounts.filter((a) => getAccountTier(a) === filter);
   }, [searchedAccounts, filter]);
+
+  const anyHideFilterActive =
+    hideFilters.hideGeminiEmpty ||
+    hideFilters.hideClaudeEmpty ||
+    hideFilters.hideNonPaid ||
+    hideFilters.hideNeedVerify ||
+    hideFilters.hideBanned403;
+
+  const allHideFiltersActive =
+    hideFilters.hideGeminiEmpty &&
+    hideFilters.hideClaudeEmpty &&
+    hideFilters.hideNonPaid &&
+    hideFilters.hideNeedVerify &&
+    hideFilters.hideBanned403;
+
+  // 叠加快捷隐藏过滤栏 (Row 2)
+  const filteredAccounts = useMemo(() => {
+    if (!anyHideFilterActive) return baseFilteredAccounts;
+
+    return baseFilteredAccounts.filter((acc) => {
+      const tier = getAccountTier(acc);
+      if (hideFilters.hideNonPaid && tier !== "pro" && tier !== "ultra") {
+        return false;
+      }
+      if (hideFilters.hideNeedVerify && isAccountNeedsVerification(acc)) {
+        return false;
+      }
+      if (hideFilters.hideBanned403 && (acc.banned || acc.quota?.is_forbidden)) {
+        return false;
+      }
+      if (hideFilters.hideGeminiEmpty || hideFilters.hideClaudeEmpty) {
+        const summaries = getGroupQuotaSummaries(acc.quota?.quota_groups, acc.quota?.models, tier);
+        if (hideFilters.hideGeminiEmpty) {
+          const gemini = summaries.find((s) => s.key === "gemini");
+          if (
+            !gemini ||
+            (!gemini.fiveHour && !gemini.weekly) ||
+            (gemini.fiveHour !== null && gemini.fiveHour !== undefined && gemini.fiveHour.percentage <= 0) ||
+            (gemini.weekly !== null && gemini.weekly !== undefined && gemini.weekly.percentage <= 0)
+          ) {
+            return false;
+          }
+        }
+        if (hideFilters.hideClaudeEmpty) {
+          const claude = summaries.find((s) => s.key === "claude");
+          if (
+            !claude ||
+            (!claude.fiveHour && !claude.weekly) ||
+            (claude.fiveHour !== null && claude.fiveHour !== undefined && claude.fiveHour.percentage <= 0) ||
+            (claude.weekly !== null && claude.weekly !== undefined && claude.weekly.percentage <= 0)
+          ) {
+            return false;
+          }
+        }
+      }
+      return true;
+    });
+  }, [baseFilteredAccounts, anyHideFilterActive, hideFilters]);
 
   // Pagination Logic
   const paginatedAccounts = useMemo(() => {
@@ -367,7 +462,7 @@ function Accounts() {
   useEffect(() => {
     setSelectedIds(new Set());
     setCurrentPage(1);
-  }, [filter, searchQuery]);
+  }, [filter, searchQuery, hideFilters]);
 
   const handleToggleSelect = (id: string) => {
     const newSet = new Set(selectedIds);
@@ -849,7 +944,7 @@ function Accounts() {
       />
 
       {/* 顶部工具栏:搜索、过滤和操作按钮 */}
-      <div className="flex-none flex items-center gap-2">
+      <div className="flex-none flex items-center gap-2 min-w-0">
         {/* 搜索框 - 响应式:大屏显示输入框,小屏显示图标 */}
         <div className="hidden lg:block flex-none w-40 relative transition-all focus-within:w-48">
           <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400" />
@@ -921,12 +1016,12 @@ function Accounts() {
           </button>
         </div>
 
-        {/* 过滤按钮组 - 图标化响应式 */}
-        <div className="flex gap-0.5 bg-gray-100/80 dark:bg-base-200 p-1 rounded-xl border border-gray-200/50 dark:border-white/5 shrink-0">
+        {/* 过滤按钮组 - 图标化响应式 (min-w-0 可横向滑动，避免挤压右侧操作栏) */}
+        <div className="flex gap-0.5 bg-gray-100/80 dark:bg-base-200 p-1 rounded-xl border border-gray-200/50 dark:border-white/5 min-w-0 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
           {/* 全部 */}
           <button
             className={cn(
-              "px-2 md:px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all flex items-center gap-1 md:gap-1.5 whitespace-nowrap shrink-0",
+              "px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all flex items-center gap-1 whitespace-nowrap shrink-0",
               filter === 'all'
                 ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-black/5"
                 : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content hover:bg-white/40"
@@ -948,7 +1043,7 @@ function Accounts() {
           {/* PRO */}
           <button
             className={cn(
-              "px-2 md:px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all flex items-center gap-1 md:gap-1.5 whitespace-nowrap shrink-0",
+              "px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all flex items-center gap-1 whitespace-nowrap shrink-0",
               filter === 'pro'
                 ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-black/5"
                 : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content hover:bg-white/40"
@@ -970,7 +1065,7 @@ function Accounts() {
           {/* ULTRA */}
           <button
             className={cn(
-              "flex px-2 lg:px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 lg:gap-1.5 whitespace-nowrap shrink-0",
+              "flex px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 whitespace-nowrap shrink-0",
               filter === 'ultra'
                 ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-black/5"
                 : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content hover:bg-white/40"
@@ -989,32 +1084,34 @@ function Accounts() {
             </span>
           </button>
 
-          {/* ENTERPRISE */}
-          <button
-            className={cn(
-              "flex px-2 lg:px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 lg:gap-1.5 whitespace-nowrap shrink-0",
-              filter === 'enterprise'
-                ? "bg-white dark:bg-base-100 text-emerald-600 dark:text-emerald-400 shadow-sm ring-1 ring-black/5"
-                : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content hover:bg-white/40"
-            )}
-            onClick={() => setFilter('enterprise')}
-            title={`ENTERPRISE (${filterCounts.enterprise})`}
-          >
-            <span className="hidden md:inline">ENTERPRISE</span>
-            <span className={cn(
-              "px-1.5 py-0.5 rounded-md text-[10px] font-bold transition-colors",
-              filter === 'enterprise'
-                ? "bg-emerald-100 dark:bg-emerald-500/20 text-emerald-600 dark:text-emerald-400"
-                : "bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400"
-            )}>
-              {filterCounts.enterprise}
-            </span>
-          </button>
+          {/* ENTERPRISE (仅在数量 > 0 或已选中时显示，节省工具栏空间) */}
+          {(filterCounts.enterprise > 0 || filter === 'enterprise') && (
+            <button
+              className={cn(
+                "flex px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 whitespace-nowrap shrink-0",
+                filter === 'enterprise'
+                  ? "bg-white dark:bg-base-100 text-emerald-600 dark:text-emerald-400 shadow-sm ring-1 ring-black/5"
+                  : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content hover:bg-white/40"
+              )}
+              onClick={() => setFilter('enterprise')}
+              title={`ENTERPRISE (${filterCounts.enterprise})`}
+            >
+              <span className="hidden md:inline">ENTERPRISE</span>
+              <span className={cn(
+                "px-1.5 py-0.5 rounded-md text-[10px] font-bold transition-colors",
+                filter === 'enterprise'
+                  ? "bg-emerald-100 dark:bg-emerald-500/20 text-emerald-600 dark:text-emerald-400"
+                  : "bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400"
+              )}>
+                {filterCounts.enterprise}
+              </span>
+            </button>
+          )}
 
           {/* FREE */}
           <button
             className={cn(
-              "flex px-2 lg:px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 lg:gap-1.5 whitespace-nowrap shrink-0",
+              "flex px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 whitespace-nowrap shrink-0",
               filter === 'free'
                 ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-black/5"
                 : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content hover:bg-white/40"
@@ -1036,7 +1133,7 @@ function Accounts() {
           {/* 异常 / 封禁 */}
           <button
             className={cn(
-              "flex px-2 lg:px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 lg:gap-1.5 whitespace-nowrap shrink-0",
+              "flex px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 whitespace-nowrap shrink-0",
               filter === 'abnormal'
                 ? "bg-white dark:bg-base-100 text-rose-600 dark:text-rose-400 shadow-sm ring-1 ring-rose-500/20"
                 : filterCounts.abnormal > 0
@@ -1062,7 +1159,7 @@ function Accounts() {
           {/* 需要验证 / 手机验证 */}
           <button
             className={cn(
-              "flex px-2 lg:px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 lg:gap-1.5 whitespace-nowrap shrink-0",
+              "flex px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 whitespace-nowrap shrink-0",
               filter === 'need_verify'
                 ? "bg-white dark:bg-base-100 text-amber-600 dark:text-amber-400 shadow-sm ring-1 ring-amber-500/20"
                 : filterCounts.need_verify > 0
@@ -1086,10 +1183,8 @@ function Accounts() {
           </button>
         </div>
 
-        <div className="flex-1 min-w-[8px]" />
-
         {/* 操作按钮组 */}
-        <div className="flex items-center gap-1.5 shrink-0">
+        <div className="flex items-center gap-1.5 shrink-0 ml-auto">
           <AddAccountDialog onAdd={handleAddAccount} showText={false} />
 
           {selectedIds.size > 0 && (
@@ -1197,6 +1292,107 @@ function Accounts() {
                 : t("common.export")}
             </span>
           </button>
+        </div>
+      </div>
+
+      {/* Row 2: Bộ lọc ẩn nhanh (Quick Hide Filter Bar) */}
+      <div className="flex-none flex items-center gap-1.5 flex-wrap px-2.5 py-1.5 rounded-xl bg-gray-50/90 dark:bg-base-200/60 border border-gray-200/60 dark:border-white/5 text-[11px]">
+        <span className="inline-flex items-center gap-1 text-gray-500 dark:text-gray-400 font-semibold mr-0.5 shrink-0">
+          <EyeOff className="w-3.5 h-3.5" />
+          <span className="hidden sm:inline">{t('accounts.quick_hide_label', 'Ẩn nhanh:')}</span>
+        </span>
+
+        {/* 1-Click Preset: Chỉ hiện nick sẵn sàng */}
+        <button
+          type="button"
+          onClick={() => {
+            const nextVal = !allHideFiltersActive;
+            setHideFilters({
+              hideGeminiEmpty: nextVal,
+              hideClaudeEmpty: nextVal,
+              hideNonPaid: nextVal,
+              hideNeedVerify: nextVal,
+              hideBanned403: nextVal,
+            });
+          }}
+          className={cn(
+            "px-2.5 py-1 rounded-lg font-bold inline-flex items-center gap-1 transition-all border cursor-pointer whitespace-nowrap",
+            allHideFiltersActive
+              ? "bg-emerald-600 text-white border-emerald-600 shadow-xs"
+              : "bg-white dark:bg-base-100 text-emerald-700 dark:text-emerald-400 border-emerald-300/70 dark:border-emerald-800/60 hover:bg-emerald-50 dark:hover:bg-emerald-950/30"
+          )}
+          title="Bật/tắt toàn bộ 5 bộ lọc ẩn nhanh chỉ với 1 cú nhấp"
+        >
+          <Zap className="w-3 h-3 fill-current" />
+          <span>{t('accounts.preset_ready_only', 'Chỉ hiện nick sẵn sàng')}</span>
+        </button>
+
+        <div className="w-px h-3.5 bg-gray-200 dark:bg-gray-700 mx-0.5 hidden sm:block" />
+
+        {[
+          {
+            key: 'hideGeminiEmpty' as const,
+            label: t('accounts.hide_gemini_empty', 'Ẩn hết Gemini'),
+            tooltip: 'Ẩn tài khoản đã cạn Gemini 5H hoặc Tuần (<= 0%)',
+          },
+          {
+            key: 'hideClaudeEmpty' as const,
+            label: t('accounts.hide_claude_empty', 'Ẩn hết Claude'),
+            tooltip: 'Ẩn tài khoản đã cạn Claude 5H / Tuần (<= 0%) hoặc không có quota Claude',
+          },
+          {
+            key: 'hideNonPaid' as const,
+            label: t('accounts.hide_non_paid', 'Ẩn ngoài PRO/ULTRA'),
+            tooltip: 'Ẩn tài khoản FREE / không thuộc gói PRO hoặc ULTRA',
+          },
+          {
+            key: 'hideNeedVerify' as const,
+            label: t('accounts.hide_need_verify', 'Ẩn Need Verify'),
+            tooltip: 'Ẩn tài khoản đang bị khóa chờ xác minh số điện thoại / bảo mật',
+          },
+          {
+            key: 'hideBanned403' as const,
+            label: t('accounts.hide_banned_403', 'Ẩn Bị Ban / 403'),
+            tooltip: 'Ẩn tài khoản bị cấm vĩnh viễn (Banned) hoặc lỗi 403 Forbidden',
+          },
+        ].map((pill) => {
+          const active = hideFilters[pill.key];
+          return (
+            <button
+              key={pill.key}
+              type="button"
+              onClick={() =>
+                setHideFilters((prev) => ({ ...prev, [pill.key]: !prev[pill.key] }))
+              }
+              title={pill.tooltip}
+              className={cn(
+                "px-2 py-1 rounded-lg font-semibold transition-all border cursor-pointer whitespace-nowrap",
+                active
+                  ? "bg-blue-600 text-white border-blue-600 shadow-2xs"
+                  : "bg-white dark:bg-base-100 text-gray-600 dark:text-gray-300 border-gray-200/80 dark:border-base-300 hover:bg-gray-100 dark:hover:bg-base-300"
+              )}
+            >
+              {pill.label}
+            </button>
+          );
+        })}
+
+        <div className="ml-auto flex items-center gap-2 shrink-0 pl-1">
+          <span className="font-mono font-semibold text-gray-500 dark:text-gray-400">
+            {t('accounts.showing_ratio', {
+              defaultValue: `Hiện ${filteredAccounts.length} / ${baseFilteredAccounts.length}`,
+            })}
+          </span>
+          {anyHideFilterActive && (
+            <button
+              type="button"
+              onClick={() => setHideFilters(DEFAULT_HIDE_FILTERS)}
+              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-950/30 font-semibold transition-colors cursor-pointer"
+            >
+              <RotateCcw className="w-3 h-3" />
+              <span>{t('common.reset', 'Đặt lại')}</span>
+            </button>
+          )}
         </div>
       </div>
 

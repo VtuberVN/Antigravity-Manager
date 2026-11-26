@@ -1846,12 +1846,8 @@ impl TokenManager {
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
             let now = chrono::Utc::now().timestamp();
-            let last_used = account
-                .get("last_used")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(now);
             let is_val_active = if block_until == 0 {
-                now.saturating_sub(last_used) < 86400
+                true
             } else {
                 now < block_until
             };
@@ -8441,37 +8437,35 @@ impl TokenManager {
         }
 
         // [NEW] 尝试从消息中提取验证链接 (#1522)
-        let extracted_url = if let Ok(parsed_json) =
-            serde_json::from_str::<serde_json::Value>(reason)
-        {
-            // 尝试从特定的 Google RPC error 结构中取
-            let mut url = None;
-            if let Some(details) = parsed_json.pointer("/error/details") {
-                if let Some(arr) = details.as_array() {
-                    for detail in arr {
-                        if let Some(meta) = detail.get("metadata") {
-                            if let Some(v_url) = meta.get("validation_url").and_then(|v| v.as_str())
-                            {
-                                url = Some(v_url.to_string());
-                                break;
-                            }
-                            if let Some(a_url) = meta.get("appeal_url").and_then(|v| v.as_str()) {
-                                url = Some(a_url.to_string());
-                                break;
+        let extracted_url =
+            crate::models::AccountBanInfo::extract_url_from_text(reason).or_else(|| {
+                if let Ok(parsed_json) = serde_json::from_str::<serde_json::Value>(reason) {
+                    let mut url = None;
+                    if let Some(details) = parsed_json.pointer("/error/details") {
+                        if let Some(arr) = details.as_array() {
+                            for detail in arr {
+                                if let Some(meta) = detail.get("metadata") {
+                                    if let Some(v_url) =
+                                        meta.get("validation_url").and_then(|v| v.as_str())
+                                    {
+                                        url = Some(v_url.to_string());
+                                        break;
+                                    }
+                                    if let Some(a_url) =
+                                        meta.get("appeal_url").and_then(|v| v.as_str())
+                                    {
+                                        url = Some(a_url.to_string());
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
+                    url
+                } else {
+                    None
                 }
-            }
-            url
-        } else {
-            // 回退方案：通过更严格的正则及反序列化解码可能的 \u0026
-            let url_regex = regex::Regex::new(r#"https://[^\s"'\\]+"#).unwrap();
-            url_regex.find(reason).map(|m| {
-                let raw_url = m.as_str().to_string();
-                raw_url.replace("\\u0026", "&")
-            })
-        };
+            });
 
         if let Some(ref url) = extracted_url {
             if let Some(mut token) = self.tokens.get_mut(account_id) {
@@ -8493,9 +8487,27 @@ impl TokenManager {
             account["validation_blocked"] = serde_json::Value::Bool(true);
             account["validation_blocked_until"] =
                 serde_json::Value::Number(serde_json::Number::from(block_until));
-            account["validation_blocked_reason"] = serde_json::Value::String(reason_owned);
+            account["validation_blocked_reason"] = serde_json::Value::String(reason_owned.clone());
             if let Some(url) = extracted_url {
                 account["validation_url"] = serde_json::Value::String(url);
+            }
+            if let Some(q) = account.get_mut("quota").and_then(|v| v.as_object_mut()) {
+                let existing_reason = q
+                    .get("forbidden_reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let existing_kind = crate::models::account::classify_lock_reason(existing_reason);
+                if !matches!(
+                    existing_kind,
+                    crate::models::account::AccountLockKind::Banned
+                        | crate::models::account::AccountLockKind::HardForbidden
+                ) {
+                    q.insert("is_forbidden".to_string(), serde_json::Value::Bool(true));
+                    q.insert(
+                        "forbidden_reason".to_string(),
+                        serde_json::Value::String(reason_owned),
+                    );
+                }
             }
         })
         .await?;

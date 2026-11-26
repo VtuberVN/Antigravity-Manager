@@ -3750,6 +3750,31 @@ fn is_validation_required_error(err: &crate::error::AppError) -> bool {
         || text.contains("appeal_url")
         || text.contains("validation required")
         || text.contains("validation_required")
+        || text.contains("account_verification")
+        || text.contains("phone_verification")
+}
+
+/// Format a standardized `VALIDATION_REQUIRED` reason string preserving readable message + `validation_url`
+/// so UI `isAccountNeedsVerification` and `extractAccountVerificationUrl` always match reliably.
+pub fn format_validation_reason(message: &str, validation_url: Option<&str>) -> String {
+    let trimmed = message.trim();
+    let base = if trimmed.is_empty() {
+        "VALIDATION_REQUIRED: Verify your account to continue.".to_string()
+    } else if trimmed.to_ascii_uppercase().contains("VALIDATION_REQUIRED") {
+        trimmed.to_string()
+    } else {
+        format!("VALIDATION_REQUIRED: {}", trimmed)
+    };
+
+    if let Some(url) = validation_url.map(str::trim).filter(|u| !u.is_empty()) {
+        if base.contains(url) {
+            base
+        } else {
+            format!("{} | validation_url: {}", base, url)
+        }
+    } else {
+        base
+    }
 }
 
 pub fn extract_action_url(reason: &str) -> Option<String> {
@@ -5035,11 +5060,12 @@ pub fn mark_account_forbidden_with_models(
 
     let lock_kind = classify_lock_reason(reason);
 
-    // 1. 在排除封禁后，如果经判定属于验证挑战（VALIDATION_REQUIRED），进入验证阻断流程
+    // 1. 在排除封禁后，如果经判定属于验证挑战（VALIDATION_REQUIRED），进入粘性验证阻断流程 (`until = 0`)
     if lock_kind == AccountLockKind::Validation {
-        let block_until = now + (10 * 60);
-        mark_validation_blocked(&mut account, reason);
-        account.validation_blocked_until = Some(block_until);
+        let extracted_url = extract_action_url(reason);
+        let formatted_reason = format_validation_reason(reason, extracted_url.as_deref());
+        mark_validation_blocked(&mut account, &formatted_reason);
+        account.validation_blocked_until = Some(0);
         account.proxy_disabled = true;
 
         // 关键守卫：若账号已有 Hard 403 / Banned 原因，必须保留原证据，绝对不能被降级为 validation_required
@@ -5694,15 +5720,30 @@ pub fn mark_account_validation_blocked(
 
     mark_validation_blocked(&mut account, reason);
     account.validation_blocked_until = Some(block_until);
+    if block_until == 0 {
+        let now = chrono::Utc::now().timestamp();
+        account.proxy_disabled = true;
+        let existing_proxy_kind =
+            classify_lock_reason(account.proxy_disabled_reason.as_deref().unwrap_or(""));
+        if !matches!(
+            existing_proxy_kind,
+            AccountLockKind::HardForbidden | AccountLockKind::Banned
+        ) {
+            account.proxy_disabled_reason = Some("validation_required".to_string());
+            account.proxy_disabled_at = Some(now);
+        }
+    }
 
     save_account(&account)?;
 
     // Update index summary to keep state synchronized
     let mut index = load_account_index()?;
-    if let Some(_summary) = index.accounts.iter_mut().find(|a| a.id == account_id) {
+    if let Some(summary) = index.accounts.iter_mut().find(|a| a.id == account_id) {
+        summary.proxy_disabled = account.proxy_disabled;
         save_account_index(&index)?;
     }
 
+    crate::proxy::server::trigger_account_reload(account_id);
     crate::modules::log_bridge::emit_accounts_refreshed();
     Ok(())
 }
@@ -5891,7 +5932,7 @@ pub async fn fetch_quota_with_retry_ext(
     let now = chrono::Utc::now().timestamp();
     let should_probe = if force_probe {
         true
-    } else if account.banned {
+    } else if account.banned || account.validation_blocked {
         account
             .last_ban_probed_at
             .map_or(true, |ts| now.saturating_sub(ts) >= 3600)
@@ -5900,6 +5941,8 @@ pub async fn fetch_quota_with_retry_ext(
             .last_ban_probed_at
             .map_or(true, |ts| now.saturating_sub(ts) >= 21600)
     };
+
+    let mut sticky_validation_reason: Option<String> = None;
 
     if should_probe {
         account.last_ban_probed_at = Some(now);
@@ -5923,6 +5966,38 @@ pub async fn fetch_quota_with_retry_ext(
                 }
 
                 return Ok(forbidden_quota_for_ban(account, &info));
+            }
+            crate::modules::quota::BanProbeOutcome::ValidationRequired {
+                message,
+                validation_url,
+            } => {
+                let reason_str = format_validation_reason(&message, validation_url.as_deref());
+                modules::logger::log_warn(&format!(
+                    "📱 [Probe] Account {} requires phone/account verification: {}",
+                    account.email, reason_str
+                ));
+                mark_validation_blocked(account, &reason_str);
+                account.validation_blocked_until = Some(0);
+                if let Some(ref url) = validation_url {
+                    account.validation_url = Some(url.clone());
+                }
+                account.proxy_disabled = true;
+                let existing_proxy_kind =
+                    classify_lock_reason(account.proxy_disabled_reason.as_deref().unwrap_or(""));
+                if !matches!(
+                    existing_proxy_kind,
+                    AccountLockKind::HardForbidden | AccountLockKind::Banned
+                ) {
+                    account.proxy_disabled_reason = Some("validation_required".to_string());
+                    account.proxy_disabled_at = Some(now);
+                }
+                if let Err(e) = mark_account_validation_blocked(&account.id, 0, &reason_str) {
+                    modules::logger::log_warn(&format!(
+                        "Failed to persist validation_blocked state for {}: {}",
+                        account.email, e
+                    ));
+                }
+                sticky_validation_reason = Some(reason_str);
             }
             crate::modules::quota::BanProbeOutcome::NotBanned => {
                 if account.banned {
@@ -5952,6 +6027,37 @@ pub async fn fetch_quota_with_retry_ext(
                             account.email, e
                         )),
                     }
+                }
+
+                // 若账号此前处于手机/人机验证阻断状态，数据面推理探针 2xx 证明已完成验证，立即自动恢复！
+                let had_validation_lock = account.validation_blocked
+                    || account.validation_blocked_until.is_some()
+                    || account.validation_blocked_reason.is_some()
+                    || account
+                        .proxy_disabled_reason
+                        .as_deref()
+                        .is_some_and(|r| classify_lock_reason(r) == AccountLockKind::Validation)
+                    || account.quota.as_ref().is_some_and(|q| {
+                        q.is_forbidden
+                            && classify_lock_reason(q.forbidden_reason.as_deref().unwrap_or(""))
+                                == AccountLockKind::Validation
+                    });
+                if had_validation_lock {
+                    clear_validation_blocked(account, true);
+                    if let Ok(mut index) = load_account_index() {
+                        if let Some(summary) =
+                            index.accounts.iter_mut().find(|a| a.id == account.id)
+                        {
+                            summary.proxy_disabled = account.proxy_disabled;
+                            let _ = save_account_index(&index);
+                        }
+                    }
+                    crate::proxy::server::trigger_account_reload(&account.id);
+                    crate::modules::log_bridge::emit_accounts_refreshed();
+                    modules::logger::log_info(&format!(
+                        "✅ [Probe] Account {} completed verification; validation lock cleared",
+                        account.email
+                    ));
                 }
 
                 // 数据面推理探针 2xx 是账号级封禁/403 的权威恢复证据。
@@ -6036,6 +6142,22 @@ pub async fn fetch_quota_with_retry_ext(
                 appeal_url: account.ban_appeal_url.clone(),
             });
         return Ok(forbidden_quota_for_ban(account, &info));
+    } else if account.is_validation_block_active(now) {
+        sticky_validation_reason = account
+            .validation_blocked_reason
+            .clone()
+            .or_else(|| {
+                account
+                    .quota
+                    .as_ref()
+                    .and_then(|q| q.forbidden_reason.clone())
+            })
+            .or_else(|| {
+                Some(format_validation_reason(
+                    "Verify your account to continue.",
+                    account.validation_url.as_deref(),
+                ))
+            });
     }
 
     // 2. 仅在探针未判定封禁后拉取配额。
@@ -6186,8 +6308,11 @@ pub async fn fetch_quota_with_retry_ext(
 
                 match retry_result {
                     Ok((q, _)) => {
-                        let q = demote_model_scoped_quota(account, q);
-                        if !q.is_forbidden {
+                        let mut q = demote_model_scoped_quota(account, q);
+                        if let Some(ref val_reason) = sticky_validation_reason {
+                            q.is_forbidden = true;
+                            q.forbidden_reason = Some(val_reason.clone());
+                        } else if !q.is_forbidden {
                             clear_validation_blocked(account, false);
                         }
                         return Ok(q);
@@ -6214,8 +6339,11 @@ pub async fn fetch_quota_with_retry_ext(
     // fetch_quota already handles 403, with additional local fallback/validation handling.
     match result {
         Ok((q, _)) => {
-            let q = demote_model_scoped_quota(account, q);
-            if !q.is_forbidden {
+            let mut q = demote_model_scoped_quota(account, q);
+            if let Some(ref val_reason) = sticky_validation_reason {
+                q.is_forbidden = true;
+                q.forbidden_reason = Some(val_reason.clone());
+            } else if !q.is_forbidden {
                 clear_validation_blocked(account, false);
             }
             Ok(q)
@@ -6247,6 +6375,13 @@ pub struct RefreshStats {
 
 /// Core logic to batch refresh all account quotas (decoupled from Tauri status)
 pub async fn refresh_all_quotas_logic() -> Result<RefreshStats, String> {
+    refresh_all_quotas_logic_ext(false).await
+}
+
+/// Extended batch quota refresh: when `manual_trigger == true` (user clicked "Refresh All"),
+/// immediately executes the authoritative `generateContent` probe on non-banned accounts
+/// (bypassing the 6h background cooldown) and re-checks `Need Verify` accounts for recovery.
+pub async fn refresh_all_quotas_logic_ext(manual_trigger: bool) -> Result<RefreshStats, String> {
     use futures::stream::{self, StreamExt};
     let start = std::time::Instant::now();
 
@@ -6269,36 +6404,32 @@ pub async fn refresh_all_quotas_logic() -> Result<RefreshStats, String> {
     let slide_delay = std::time::Duration::from_secs_f64(slide_delay_secs);
 
     crate::modules::logger::log_info(&format!(
-        "Starting batch refresh of all account quotas (sliding window: max {} concurrent, slot handoff delay {:.2}s)",
-        max_concurrent, slide_delay_secs
+        "Starting batch refresh of all account quotas (manual={}, sliding window: max {} concurrent, slot handoff delay {:.2}s)",
+        manual_trigger, max_concurrent, slide_delay_secs
     ));
     let accounts = list_accounts()?;
 
     let filtered_accounts: Vec<_> = accounts
         .into_iter()
         .filter(|account| {
-            // [MOD] Now we allow refreshing disabled and proxy_disabled accounts
-            // to support forced re-sync from UI.
-            //
-            // 只跳过「验证封禁仍在生效期内」的账号。封禁过期后必须放行刷新 —— 刷新
-            // 正是判断"还封不封"的手段；跳过它会让 quota.is_forbidden 永远是 true：
-            // 403 把它置 true、只有刷新成功才会写回 false，而刷新又在这里被跳过，
-            // 形成环形依赖，账号再也回不来（issue #3630）。
-            if let Some(ref q) = account.quota {
-                if q.is_forbidden {
-                    let now = chrono::Utc::now().timestamp();
-                    // 统一走 is_validation_block_active 判定有效冷静期
-                    if account.is_validation_block_active(now) {
-                        crate::modules::logger::log_info(&format!(
-                            "  - Skipping {} (Forbidden, 验证封禁中)",
-                            account.email
-                        ));
-                        return false;
+            // 显式手动触发（"Làm mới Tất cả"）时，绝不跳过处于验证锁定的账号，以便用户完成手机验证后一键解封！
+            if !manual_trigger {
+                if let Some(ref q) = account.quota {
+                    if q.is_forbidden {
+                        let now = chrono::Utc::now().timestamp();
+                        if account.is_validation_block_active(now) {
+                            let probed_recently = account
+                                .last_ban_probed_at
+                                .is_some_and(|ts| now.saturating_sub(ts) < 3600);
+                            if probed_recently {
+                                crate::modules::logger::log_info(&format!(
+                                    "  - Skipping {} (Forbidden, 验证封禁冷却中)",
+                                    account.email
+                                ));
+                                return false;
+                            }
+                        }
                     }
-                    crate::modules::logger::log_info(&format!(
-                        "  - Retrying {} (Forbidden 但验证封禁已过期，重新探测)",
-                        account.email
-                    ));
                 }
             }
             true
@@ -6320,7 +6451,13 @@ pub async fn refresh_all_quotas_logic() -> Result<RefreshStats, String> {
             let account_id = account.id.clone();
             crate::modules::logger::log_info(&format!("  - Processing {}", email));
 
-            let result = match fetch_quota_with_retry(&mut account).await {
+            let quota_res = if manual_trigger && !account.banned {
+                fetch_quota_with_retry_forced(&mut account).await
+            } else {
+                fetch_quota_with_retry(&mut account).await
+            };
+
+            let result = match quota_res {
                 Ok(quota) => {
                     // 批量模式下不在此处反复重写全局大索引 accounts.json (sync_index: false)
                     match update_account_quota_internal(&account_id, quota, false) {
