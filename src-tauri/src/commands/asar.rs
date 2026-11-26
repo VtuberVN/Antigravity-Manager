@@ -230,10 +230,72 @@ pub async fn set_asar_equivalent_fallback(
 }
 
 #[tauri::command]
+pub async fn set_asar_cross_family_fallback(
+    enabled: bool,
+    proxy_state: State<'_, crate::commands::proxy::ProxyServiceState>,
+) -> Result<AsarTelemetrySnapshot, String> {
+    asar_bridge::set_cross_family_fallback_enabled(enabled);
+    let app_state = current_app_state(&proxy_state).await;
+    Ok(asar_bridge::snapshot_asar_telemetry(app_state.as_ref()).await)
+}
+
+#[tauri::command]
+pub async fn set_asar_separate_lite_slot(
+    enabled: bool,
+    proxy_state: State<'_, crate::commands::proxy::ProxyServiceState>,
+) -> Result<AsarTelemetrySnapshot, String> {
+    asar_bridge::set_separate_lite_slot_enabled(enabled);
+    let app_state = current_app_state(&proxy_state).await;
+    Ok(asar_bridge::snapshot_asar_telemetry(app_state.as_ref()).await)
+}
+
+#[tauri::command]
 pub async fn reset_asar_slots(
     proxy_state: State<'_, crate::commands::proxy::ProxyServiceState>,
 ) -> Result<AsarTelemetrySnapshot, String> {
     asar_bridge::reset_dual_track_slots();
     let app_state = current_app_state(&proxy_state).await;
     Ok(asar_bridge::snapshot_asar_telemetry(app_state.as_ref()).await)
+}
+
+#[tauri::command]
+pub async fn refresh_ide_models(
+    state: State<'_, crate::commands::proxy::ProxyServiceState>,
+) -> Result<String, String> {
+    let target_port = asar_patch::get_asar_bridge_port();
+    tokio::task::spawn_blocking(|| asar_patch::start_heartbeat(false))
+        .await
+        .map_err(|e| format!("Task panicked: {}", e))?;
+
+    let status = crate::commands::proxy::ensure_asar_bridge_started(target_port, &state).await?;
+
+    let synced = tokio::task::spawn_blocking(asar_model_catalog::sync_models_from_accounts)
+        .await
+        .map_err(|e| format!("Task panicked: {}", e))?
+        .unwrap_or(0);
+
+    let prewarm_url = format!(
+        "http://127.0.0.1:{}/v1internal:fetchAvailableModels",
+        status.port
+    );
+    if let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        let _ = client
+            .post(&prewarm_url)
+            .header("Content-Type", "application/json")
+            .body("{}")
+            .send()
+            .await;
+    }
+
+    tokio::task::spawn_blocking(asar_patch::hot_switch_running_antigravity)
+        .await
+        .map_err(|e| format!("Task panicked: {}", e))?;
+
+    Ok(format!(
+        "Synced {} pool models and refreshed IDE language_server on port {}",
+        synced, status.port
+    ))
 }

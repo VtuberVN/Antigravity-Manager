@@ -908,6 +908,9 @@ struct RichestUpstream {
     score: usize,
     models: Map<String, Value>,
     sorts: Value,
+    grouped_models: Map<String, Value>,
+    experiment_ids: Option<Value>,
+    shared_model_experiments: Option<Value>,
 }
 
 fn richness_score(models: &Map<String, Value>) -> usize {
@@ -936,21 +939,33 @@ fn load_richest_from_disk() -> Option<RichestUpstream> {
     let Some(Value::Object(models)) = root.get("models").cloned() else {
         return None;
     };
+    // Invalidate legacy cache files that predate `groupedModels` capture so they re-save with it.
+    let Some(Value::Object(grouped_models)) = root.get("groupedModels").cloned() else {
+        return None;
+    };
+    if grouped_models.is_empty() {
+        return None;
+    }
     let sorts = root
         .get("agentModelSorts")
         .cloned()
         .unwrap_or(Value::Array(Vec::new()));
+    let experiment_ids = root.get("experimentIds").cloned();
+    let shared_model_experiments = root.get("sharedModelExperiments").cloned();
     Some(RichestUpstream {
         score: richness_score(&models),
         models,
         sorts,
+        grouped_models,
+        experiment_ids,
+        shared_model_experiments,
     })
 }
 
 static RICHEST_UPSTREAM: Lazy<RwLock<Option<RichestUpstream>>> =
     Lazy::new(|| RwLock::new(load_richest_from_disk()));
 
-/// Remember the richest live `fetchAvailableModels` payload (models + `agentModelSorts`) seen so far.
+/// Remember the richest live `fetchAvailableModels` payload (models + `agentModelSorts` + `groupedModels` + experiments) seen so far.
 fn remember_richest_upstream(root: &Map<String, Value>) {
     if cfg!(test) {
         return;
@@ -963,33 +978,54 @@ fn remember_richest_upstream(root: &Map<String, Value>) {
         .get("agentModelSorts")
         .cloned()
         .unwrap_or(Value::Array(Vec::new()));
+    let grouped_models = root
+        .get("groupedModels")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let experiment_ids = root.get("experimentIds").cloned();
+    let shared_model_experiments = root.get("sharedModelExperiments").cloned();
 
     let Ok(mut guard) = RICHEST_UPSTREAM.write() else {
         return;
     };
     let existing_score = guard.as_ref().map(|r| r.score);
+    let existing_has_groups = guard.as_ref().is_some_and(|r| !r.grouped_models.is_empty());
     if existing_score.is_some_and(|s| score < s) {
         return;
     }
-    let should_persist = existing_score.is_none_or(|s| score > s);
+    let should_persist = existing_score.is_none_or(|s| score > s)
+        || (!existing_has_groups && !grouped_models.is_empty());
     *guard = Some(RichestUpstream {
         score,
         models: models.clone(),
         sorts: sorts.clone(),
+        grouped_models: grouped_models.clone(),
+        experiment_ids: experiment_ids.clone(),
+        shared_model_experiments: shared_model_experiments.clone(),
     });
     drop(guard);
 
     if should_persist {
-        let payload = json!({ "models": models, "agentModelSorts": sorts });
+        let mut payload = Map::new();
+        payload.insert("models".to_string(), Value::Object(models.clone()));
+        payload.insert("agentModelSorts".to_string(), sorts);
+        payload.insert("groupedModels".to_string(), Value::Object(grouped_models));
+        if let Some(exp) = experiment_ids {
+            payload.insert("experimentIds".to_string(), exp);
+        }
+        if let Some(shared) = shared_model_experiments {
+            payload.insert("sharedModelExperiments".to_string(), shared);
+        }
         let path = richest_upstream_path();
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let _ = fs::write(path, payload.to_string());
+        let _ = fs::write(path, Value::Object(payload).to_string());
     }
 }
 
-/// Restore missing flagship entries + sort groups into a poorer upstream response.
+/// Restore missing flagship entries, `groupedModels`, sort groups, and experiments into a poorer upstream response.
 fn merge_richest_into_response(original_json: &str, richest: &RichestUpstream) -> String {
     let Ok(Value::Object(mut root)) = serde_json::from_str::<Value>(original_json) else {
         return original_json.to_string();
@@ -1010,6 +1046,25 @@ fn merge_richest_into_response(original_json: &str, richest: &RichestUpstream) -
     root.insert("models".to_string(), Value::Object(merged));
     if richest.sorts.as_array().is_some_and(|a| !a.is_empty()) {
         root.insert("agentModelSorts".to_string(), richest.sorts.clone());
+    }
+    if !richest.grouped_models.is_empty() {
+        let mut grouped = root
+            .get("groupedModels")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for (k, v) in &richest.grouped_models {
+            grouped.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        root.insert("groupedModels".to_string(), Value::Object(grouped));
+    }
+    if let Some(exp) = &richest.experiment_ids {
+        root.entry("experimentIds".to_string())
+            .or_insert_with(|| exp.clone());
+    }
+    if let Some(shared) = &richest.shared_model_experiments {
+        root.entry("sharedModelExperiments".to_string())
+            .or_insert_with(|| shared.clone());
     }
     Value::Object(root).to_string()
 }
@@ -1465,6 +1520,9 @@ fn inject_with_catalog(
     // 5. Preserve tieredModelIds.flashLite (critical for search_web and /teamwork)
     sync_tiered_model_ids(&mut root_obj, &normalized_models);
 
+    // 6. Ensure `groupedModels` contains every active tiered family (Carbon, Neon, Argon, Claude 5.5, Hydrogen, 3.8 Flash)
+    ensure_grouped_models_complete(&mut root_obj, &normalized_models);
+
     root_obj.remove("deprecatedModelIds");
     if !root_obj.get("commandModelIds").is_some_and(Value::is_array) {
         let cmd_default = root_obj
@@ -1483,6 +1541,123 @@ fn inject_with_catalog(
 
     root_obj.insert("models".to_string(), Value::Object(normalized_models));
     Value::Object(root_obj).to_string()
+}
+
+fn family_display_name_from_id(
+    family_id: &str,
+    sample_node: Option<&Map<String, Value>>,
+) -> String {
+    if let Some(dn) = sample_node
+        .and_then(|n| n.get("displayName"))
+        .and_then(Value::as_str)
+    {
+        let trimmed = dn.trim();
+        let stripped = [
+            " (Low)",
+            " (Medium)",
+            " (High)",
+            " (XHigh)",
+            " Low",
+            " Medium",
+            " High",
+            " XHigh",
+        ]
+        .iter()
+        .find_map(|suffix| trimmed.strip_suffix(suffix))
+        .unwrap_or(trimmed);
+        if !stripped.is_empty() {
+            return stripped.to_string();
+        }
+    }
+
+    // Fallback: format `claude-sonnet-5-5` -> `Claude Sonnet 5.5`, `gemini-4-carbon` -> `Gemini 4 Carbon`
+    let parts: Vec<&str> = family_id.split('-').collect();
+    let mut out = Vec::with_capacity(parts.len());
+    let mut i = 0;
+    while i < parts.len() {
+        let p = parts[i];
+        if i + 1 < parts.len()
+            && p.len() == 1
+            && p.chars().all(|c| c.is_ascii_digit())
+            && parts[i + 1].len() == 1
+            && parts[i + 1].chars().all(|c| c.is_ascii_digit())
+        {
+            out.push(format!("{}.{}", p, parts[i + 1]));
+            i += 2;
+            continue;
+        }
+        let mut chars = p.chars();
+        let titled = match chars.next() {
+            Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+            None => String::new(),
+        };
+        out.push(titled);
+        i += 1;
+    }
+    out.join(" ")
+}
+
+/// Ensures `root_obj["groupedModels"]` has an entry for every active tiered model family
+/// (`<family>-low`, `-medium`, `-high`, `-xhigh`) present in `normalized_models`.
+fn ensure_grouped_models_complete(
+    root_obj: &mut Map<String, Value>,
+    normalized_models: &Map<String, Value>,
+) {
+    const TIER_SUFFIXES: [(&str, &str); 4] = [
+        ("-low", "LOW"),
+        ("-medium", "MEDIUM"),
+        ("-high", "HIGH"),
+        ("-xhigh", "XHIGH"),
+    ];
+
+    let mut families: HashMap<String, (Vec<&'static str>, Option<&Map<String, Value>>)> =
+        HashMap::new();
+
+    for (model_id, val) in normalized_models {
+        let lower = model_id.to_ascii_lowercase();
+        for &(suffix, level) in &TIER_SUFFIXES {
+            if let Some(prefix_len) = lower.strip_suffix(suffix).map(|s| s.len()) {
+                let family_id = model_id[..prefix_len].to_string();
+                let entry = families
+                    .entry(family_id)
+                    .or_insert_with(|| (Vec::new(), None));
+                if !entry.0.contains(&level) {
+                    entry.0.push(level);
+                }
+                if entry.1.is_none() || suffix == "-medium" {
+                    entry.1 = val.as_object();
+                }
+                break;
+            }
+        }
+    }
+
+    if families.is_empty() {
+        return;
+    }
+
+    let mut grouped = match root_obj.remove("groupedModels") {
+        Some(Value::Object(m)) => m,
+        _ => Map::new(),
+    };
+
+    let order = ["LOW", "MEDIUM", "HIGH", "XHIGH"];
+    for (family_id, (mut levels, sample_node)) in families {
+        if grouped.contains_key(&family_id) {
+            continue;
+        }
+        levels.sort_by_key(|lvl| order.iter().position(|o| o == lvl).unwrap_or(99));
+        let display_name = family_display_name_from_id(&family_id, sample_node);
+        grouped.insert(
+            family_id,
+            json!({
+                "displayName": display_name,
+                "supportedThinkingLevels": levels,
+            }),
+        );
+    }
+
+    root_obj.insert("groupedModels".to_string(), Value::Object(grouped));
 }
 
 fn sync_agent_model_sorts(
@@ -1749,12 +1924,33 @@ mod tests {
             score: richness_score(&models),
             models,
             sorts: root.get("agentModelSorts").cloned().unwrap(),
+            grouped_models: json!({
+                "gemini-4-carbon": {
+                    "displayName": "Gemini 4 Carbon",
+                    "supportedThinkingLevels": ["LOW", "MEDIUM", "HIGH", "XHIGH"]
+                },
+                "claude-opus-5-5": {
+                    "displayName": "Claude Opus 5.5",
+                    "supportedThinkingLevels": ["LOW", "MEDIUM", "HIGH"]
+                }
+            })
+            .as_object()
+            .cloned()
+            .unwrap(),
+            experiment_ids: Some(json!(["exp_carbon_canary"])),
+            shared_model_experiments: Some(json!({ "carbon": true })),
         };
         assert!(richest.score >= 2000);
 
         // A Basic account answers with only Hydrogen.
         let basic = json!({
             "models": { "gemini-4-hydrogen-medium": { "displayName": "Hydrogen" } },
+            "groupedModels": {
+                "gemini-4-hydrogen": {
+                    "displayName": "Gemini 4 Hydrogen",
+                    "supportedThinkingLevels": ["LOW", "HIGH"]
+                }
+            },
             "agentModelSorts": [{
                 "displayName": "Recommended",
                 "groups": [{ "modelIds": ["gemini-4-hydrogen-medium"] }]
@@ -1767,6 +1963,12 @@ mod tests {
         let models = merged["models"].as_object().unwrap();
         assert!(models.contains_key("gemini-4-carbon-medium"));
         assert!(models.contains_key("claude-opus-5-5-high"));
+        let grouped = merged["groupedModels"].as_object().unwrap();
+        assert!(grouped.contains_key("gemini-4-hydrogen"));
+        assert!(grouped.contains_key("gemini-4-carbon"));
+        assert!(grouped.contains_key("claude-opus-5-5"));
+        assert_eq!(merged["experimentIds"], json!(["exp_carbon_canary"]));
+        assert_eq!(merged["sharedModelExperiments"], json!({ "carbon": true }));
         let ids = merged["agentModelSorts"][0]["groups"][0]["modelIds"]
             .as_array()
             .unwrap();
@@ -1775,6 +1977,50 @@ mod tests {
         // A response that is already as rich is returned untouched.
         let full = json!({ "models": richest.models.clone() }).to_string();
         assert_eq!(merge_richest_into_response(&full, &richest), full);
+    }
+
+    #[test]
+    fn test_ensure_grouped_models_complete_synthesizes_missing_families() {
+        let basic = json!({
+            "models": {
+                "gemini-4-hydrogen-low": { "displayName": "Gemini 4 Hydrogen (Low)" },
+                "gemini-4-hydrogen-high": { "displayName": "Gemini 4 Hydrogen (High)" },
+                "gemini-4-carbon-medium": { "displayName": "Gemini 4 Carbon (Medium)" },
+                "gemini-4-carbon-high": { "displayName": "Gemini 4 Carbon (High)" },
+                "claude-sonnet-5-5-low": { "displayName": "Claude Sonnet 5.5 (Low)" },
+                "claude-sonnet-5-5-medium": { "displayName": "Claude Sonnet 5.5 (Medium)" }
+            },
+            "groupedModels": {
+                "gemini-4-hydrogen": {
+                    "displayName": "Custom Hydrogen",
+                    "supportedThinkingLevels": ["LOW", "HIGH"]
+                }
+            }
+        })
+        .to_string();
+
+        let out: Value =
+            serde_json::from_str(&inject_with_catalog(&basic, &[], &HashMap::new())).unwrap();
+        let grouped = out["groupedModels"].as_object().unwrap();
+        // Existing entry is preserved untouched
+        assert_eq!(
+            grouped["gemini-4-hydrogen"]["displayName"],
+            "Custom Hydrogen"
+        );
+        // Missing tiered families are synthesized
+        assert_eq!(grouped["gemini-4-carbon"]["displayName"], "Gemini 4 Carbon");
+        assert_eq!(
+            grouped["gemini-4-carbon"]["supportedThinkingLevels"],
+            json!(["MEDIUM", "HIGH"])
+        );
+        assert_eq!(
+            grouped["claude-sonnet-5-5"]["displayName"],
+            "Claude Sonnet 5.5"
+        );
+        assert_eq!(
+            grouped["claude-sonnet-5-5"]["supportedThinkingLevels"],
+            json!(["LOW", "MEDIUM"])
+        );
     }
 
     #[test]

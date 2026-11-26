@@ -483,8 +483,9 @@ function AccountRowContent({
                         {(() => {
                             const isAsarInFlight = Boolean(asarTelemetry?.asar_in_flight_account_ids?.includes(account.id));
                             const isAsarActive = isAsarInFlight || asarTelemetry?.last_active_account_id === account.id;
-                            const isClaudeSlot = Boolean(asarTelemetry?.dual_track_enabled && asarTelemetry?.claude_slot_account_id === account.id);
-                            const isGeminiSlot = Boolean(asarTelemetry?.dual_track_enabled && asarTelemetry?.gemini_slot_account_id === account.id);
+                            const accountSlots = asarTelemetry?.active_slots?.filter((s) => s.account_id === account.id) ?? [];
+                            const isClaudeSlot = accountSlots.length === 0 && Boolean(asarTelemetry?.dual_track_enabled && asarTelemetry?.claude_slot_account_id === account.id);
+                            const isGeminiSlot = accountSlots.length === 0 && Boolean(asarTelemetry?.dual_track_enabled && asarTelemetry?.gemini_slot_account_id === account.id);
                             const isProxyInFlight = Boolean(asarTelemetry?.proxy_in_flight_account_ids?.includes(account.id));
                             const isProxyActive = isProxyInFlight || asarTelemetry?.proxy_last_account_id === account.id;
 
@@ -507,6 +508,39 @@ function AccountRowContent({
                                             <span>ASAR Active</span>
                                         </span>
                                     )}
+                                    {accountSlots.map((slot) => {
+                                        const icon =
+                                            slot.family === 'Claude'
+                                                ? '👑'
+                                                : slot.tier_kind === 'Full'
+                                                    ? '✨'
+                                                    : slot.tier_kind === 'Lite'
+                                                        ? '⚡'
+                                                        : '🔹';
+                                        const badgeCls =
+                                            slot.family === 'Claude'
+                                                ? 'bg-amber-100/90 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 border-amber-300/60 dark:border-amber-700/60'
+                                                : slot.tier_kind === 'Full'
+                                                    ? 'bg-emerald-100/90 dark:bg-emerald-950/60 text-emerald-800 dark:text-emerald-300 border-emerald-300/60 dark:border-emerald-700/60'
+                                                    : slot.tier_kind === 'Lite'
+                                                        ? 'bg-indigo-100/90 dark:bg-indigo-950/60 text-indigo-800 dark:text-indigo-300 border-indigo-300/60 dark:border-indigo-700/60'
+                                                        : 'bg-cyan-100/90 dark:bg-cyan-950/60 text-cyan-800 dark:text-cyan-300 border-cyan-300/60 dark:border-cyan-700/60';
+                                        return (
+                                            <span
+                                                key={slot.slot_key}
+                                                className={`px-1.5 py-0.5 rounded-md text-[10px] font-bold inline-flex items-center gap-1 shadow-xs border ${badgeCls}`}
+                                                title={`ASAR Slot: ${slot.family} ${slot.tier_kind}${slot.models.length > 0 ? ` [${slot.models.join(' ; ')}]` : ''}`}
+                                            >
+                                                {slot.in_flight > 0 && (
+                                                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-ping" />
+                                                )}
+                                                <span>
+                                                    {icon} {slot.family}
+                                                    {slot.models.length > 0 ? ` [${slot.models.join(' ; ')}]` : ` ${slot.tier_kind}`}
+                                                </span>
+                                            </span>
+                                        );
+                                    })}
                                     {isClaudeSlot && (
                                         <span
                                             className="px-1.5 py-0.5 rounded-md bg-amber-100/90 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 text-[10px] font-bold shadow-xs border border-amber-300/60 dark:border-amber-700/60"

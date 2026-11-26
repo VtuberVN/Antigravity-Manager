@@ -38,6 +38,12 @@ struct AsarBridgeConfig {
     /// Graceful Equivalent Model Fallback (Carbon/Neon/Argon -> Hydrogen, Claude 5.5 -> 4.6) toggle.
     #[serde(default = "default_bridge_flag_true")]
     pub equivalent_fallback_enabled: bool,
+    /// Separate sticky Basic account slot for background `*-flash-lite*` micro-models.
+    #[serde(default = "default_bridge_flag_true")]
+    pub separate_lite_slot: bool,
+    /// Cross-family rescue fallback (Claude/GPT <-> Gemini) when an entire model family is exhausted.
+    #[serde(default = "default_bridge_flag_true")]
+    pub cross_family_fallback_enabled: bool,
 }
 
 impl Default for AsarBridgeConfig {
@@ -46,6 +52,8 @@ impl Default for AsarBridgeConfig {
             port: DEFAULT_BRIDGE_PORT,
             dual_track_enabled: true,
             equivalent_fallback_enabled: true,
+            separate_lite_slot: true,
+            cross_family_fallback_enabled: true,
         }
     }
 }
@@ -148,6 +156,36 @@ pub fn persist_equivalent_fallback_flag(enabled: bool) -> Result<(), String> {
         return Ok(());
     }
     cfg.equivalent_fallback_enabled = enabled;
+    save_bridge_config(&cfg)
+}
+
+/// Persisted `separate_lite_slot` toggle; defaults to `true`.
+pub fn get_separate_lite_slot_flag() -> bool {
+    load_bridge_config().separate_lite_slot
+}
+
+/// Persist the `separate_lite_slot` toggle without touching other bridge settings.
+pub fn persist_separate_lite_slot_flag(enabled: bool) -> Result<(), String> {
+    let mut cfg = load_bridge_config();
+    if cfg.separate_lite_slot == enabled {
+        return Ok(());
+    }
+    cfg.separate_lite_slot = enabled;
+    save_bridge_config(&cfg)
+}
+
+/// Persisted `cross_family_fallback_enabled` toggle; defaults to `true`.
+pub fn get_cross_family_fallback_flag() -> bool {
+    load_bridge_config().cross_family_fallback_enabled
+}
+
+/// Persist the `cross_family_fallback_enabled` toggle without touching other bridge settings.
+pub fn persist_cross_family_fallback_flag(enabled: bool) -> Result<(), String> {
+    let mut cfg = load_bridge_config();
+    if cfg.cross_family_fallback_enabled == enabled {
+        return Ok(());
+    }
+    cfg.cross_family_fallback_enabled = enabled;
     save_bridge_config(&cfg)
 }
 
@@ -472,6 +510,44 @@ pub fn hot_switch_running_antigravity() {
             if name.contains("language_server") {
                 let _ = proc_info.kill();
             }
+        }
+    }
+}
+
+/// Kills running `language_server` processes ONLY if their command line does NOT already
+/// point to `127.0.0.1:{port}` (e.g. spawned while Manager was closed).
+pub fn hot_switch_if_unbridged(port: u16) {
+    #[cfg(not(target_os = "android"))]
+    {
+        let mut sys = System::new();
+        sys.refresh_processes(ProcessesToUpdate::All);
+        let my_pid = std::process::id();
+        let expected_bridge = format!("127.0.0.1:{}", port);
+        let mut killed = 0usize;
+
+        for (pid, proc_info) in sys.processes() {
+            if pid.as_u32() == my_pid {
+                continue;
+            }
+            let name = proc_info.name().to_string_lossy().to_lowercase();
+            if name.contains("language_server") {
+                let cmdline = proc_info
+                    .cmd()
+                    .iter()
+                    .map(|s| s.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !cmdline.contains(&expected_bridge) && proc_info.kill() {
+                    killed += 1;
+                }
+            }
+        }
+        if killed > 0 {
+            tracing::info!(
+                "[ASAR-Patch] Hot-switched {} unbridged language_server process(es) onto {}",
+                killed,
+                expected_bridge
+            );
         }
     }
 }

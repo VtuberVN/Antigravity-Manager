@@ -51,9 +51,44 @@ pub struct AsarBridgeStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AsarActiveSlot {
+    pub slot_key: String, // "claude_full" | "claude_basic" | "gemini_full" | "gemini_basic" | "gemini_lite"
+    pub family: String,   // "Claude" | "Gemini"
+    pub tier_kind: String, // "Full" | "Basic" | "Lite"
+    pub account_id: String,
+    pub email: String,
+    pub models: Vec<String>, // Distinct short readable model labels served on this account in this slot
+    pub in_flight: u64,      // Live active streaming count on this account
+    pub last_used_ts: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AsarInFlightStream {
+    pub stream_id: u64,
+    pub slot_key: String,
+    pub account_id: String,
+    pub email: String,
+    pub requested_model: String,
+    pub target_model: String,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveStreamRecord {
+    stream_id: u64,
+    slot_key: String,
+    account_id: String,
+    email: String,
+    requested_model: String,
+    target_model: String,
+    started_at: std::time::Instant,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AsarTelemetrySnapshot {
     pub in_flight: u64,
     pub asar_in_flight_account_ids: Vec<String>,
+    pub in_flight_streams: Vec<AsarInFlightStream>,
     pub total_requests: u64,
     pub failover_count: u64,
     pub total_input_tokens: u64,
@@ -64,6 +99,8 @@ pub struct AsarTelemetrySnapshot {
     pub last_active_model: Option<String>,
     pub last_active_timestamp: Option<i64>,
     pub dual_track_enabled: bool,
+    pub separate_lite_slot: bool,
+    pub active_slots: Vec<AsarActiveSlot>,
     pub claude_slot_account_id: Option<String>,
     pub claude_slot_email: Option<String>,
     pub gemini_slot_account_id: Option<String>,
@@ -73,6 +110,7 @@ pub struct AsarTelemetrySnapshot {
     pub proxy_in_flight_account_ids: Vec<String>,
     pub native_current_account_id: Option<String>,
     pub equivalent_fallback_enabled: bool,
+    pub cross_family_fallback_enabled: bool,
     pub fallback_downgrade_count: u64,
     pub last_fallback_route: Option<String>,
 }
@@ -83,6 +121,126 @@ struct LastActiveRecord {
     email: String,
     model: String,
     timestamp: i64,
+}
+
+const SLOT_ORDER: [&str; 5] = [
+    "claude_full",
+    "claude_basic",
+    "gemini_full",
+    "gemini_basic",
+    "gemini_lite",
+];
+
+#[derive(Debug, Clone)]
+struct SlotState {
+    account_id: String,
+    email: String,
+    models: Vec<String>,
+    last_used_ts: i64,
+}
+
+pub(crate) fn resolve_slot_key(
+    is_claude_track: bool,
+    model: &str,
+    separate_lite_slot: bool,
+) -> &'static str {
+    let is_canary = is_flagship_canary_model(model);
+    if is_claude_track {
+        if is_canary {
+            "claude_full"
+        } else {
+            "claude_basic"
+        }
+    } else if is_canary {
+        "gemini_full"
+    } else if separate_lite_slot && is_flash_lite_model(model) {
+        "gemini_lite"
+    } else {
+        "gemini_basic"
+    }
+}
+
+pub(crate) fn short_slot_model_label(model: &str) -> String {
+    let lower = model.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return String::new();
+    }
+    if lower.contains("carbon") {
+        return "Carbon".to_string();
+    }
+    if lower.contains("neon") {
+        return "Neon".to_string();
+    }
+    if lower.contains("argon") {
+        return "Argon".to_string();
+    }
+    if lower.contains("hydrogen") {
+        return "Hydrogen".to_string();
+    }
+    if lower.contains("orchestrator") {
+        return "Orchestrator".to_string();
+    }
+    if lower.contains("3.5-flash-lite") || lower.contains("3-5-flash-lite") {
+        return "3.5 Flash Lite".to_string();
+    }
+    if lower.contains("flash-lite") {
+        return "Flash Lite".to_string();
+    }
+    if lower.contains("3.8-flash") || lower.contains("3-8-flash") {
+        return "3.8 Flash".to_string();
+    }
+    if lower.contains("2.5-flash") || lower.contains("2-5-flash") {
+        return "2.5 Flash".to_string();
+    }
+    if lower.contains("claude") {
+        if lower.contains("opus") && lower.contains("5-5") {
+            return "Opus 5.5".to_string();
+        }
+        if lower.contains("sonnet") && lower.contains("5-5") {
+            return "Sonnet 5.5".to_string();
+        }
+        if lower.contains("opus") && lower.contains("4-6") {
+            return "Opus 4.6".to_string();
+        }
+        if lower.contains("sonnet") && lower.contains("4-6") {
+            return "Sonnet 4.6".to_string();
+        }
+        if lower.contains("haiku") {
+            return "Haiku".to_string();
+        }
+    }
+    if lower.contains("gpt-oss") {
+        return "GPT-OSS".to_string();
+    }
+
+    let stripped = lower
+        .trim_end_matches("-thinking")
+        .trim_end_matches("-xhigh")
+        .trim_end_matches("-high")
+        .trim_end_matches("-medium")
+        .trim_end_matches("-low");
+    stripped
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn slot_meta(slot_key: &str) -> (&'static str, &'static str) {
+    match slot_key {
+        "claude_full" => ("Claude", "Full"),
+        "claude_basic" => ("Claude", "Basic"),
+        "gemini_full" => ("Gemini", "Full"),
+        "gemini_lite" => ("Gemini", "Lite"),
+        _ => ("Gemini", "Basic"),
+    }
 }
 
 struct AsarTelemetryHub {
@@ -96,22 +254,35 @@ struct AsarTelemetryHub {
     last_active: RwLock<Option<LastActiveRecord>>,
     dual_track_enabled: AtomicBool,
     equivalent_fallback_enabled: AtomicBool,
+    cross_family_fallback_enabled: AtomicBool,
+    separate_lite_slot: AtomicBool,
     fallback_downgrade_count: AtomicU64,
     last_fallback_route: RwLock<Option<String>>,
+    /// 5 named sticky slots: claude_full, claude_basic, gemini_full, gemini_basic, gemini_lite
+    slots: RwLock<HashMap<&'static str, SlotState>>,
+    /// Live concurrent AI streams currently in flight
+    next_stream_id: AtomicU64,
+    active_streams: std::sync::Mutex<Vec<ActiveStreamRecord>>,
+    /// Legacy locks kept for direct unit-test compatibility
     claude_slot: RwLock<Option<(String, String)>>,
     gemini_slot: RwLock<Option<(String, String)>>,
-    /// Internal Gemini-Basic slot: sticks all non-flagship calls (Hydrogen / Flash / flash-lite)
-    /// to 1 Basic account for 99% prompt-cache hits; zero UI change — snapshot shows gemini_slot
-    /// if set, else falls back to this for the ⚡ Gemini row.
     gemini_basic_slot: RwLock<Option<(String, String)>>,
 }
 
 impl AsarTelemetryHub {
     fn new() -> Self {
-        let (persisted_dual_track, persisted_fallback) = if cfg!(test) {
-            (true, true)
+        let (
+            persisted_dual_track,
+            persisted_fallback,
+            persisted_separate_lite,
+            persisted_cross_family,
+        ) = if cfg!(test) {
+            (true, true, true, true)
         } else {
-            crate::modules::asar_patch::get_bridge_flags()
+            let (dt, ef) = crate::modules::asar_patch::get_bridge_flags();
+            let sl = crate::modules::asar_patch::get_separate_lite_slot_flag();
+            let cf = crate::modules::asar_patch::get_cross_family_fallback_flag();
+            (dt, ef, sl, cf)
         };
         Self {
             in_flight: AtomicU64::new(0),
@@ -124,8 +295,13 @@ impl AsarTelemetryHub {
             last_active: RwLock::new(None),
             dual_track_enabled: AtomicBool::new(persisted_dual_track),
             equivalent_fallback_enabled: AtomicBool::new(persisted_fallback),
+            cross_family_fallback_enabled: AtomicBool::new(persisted_cross_family),
+            separate_lite_slot: AtomicBool::new(persisted_separate_lite),
             fallback_downgrade_count: AtomicU64::new(0),
             last_fallback_route: RwLock::new(None),
+            slots: RwLock::new(HashMap::new()),
+            next_stream_id: AtomicU64::new(0),
+            active_streams: std::sync::Mutex::new(Vec::new()),
             claude_slot: RwLock::new(None),
             gemini_slot: RwLock::new(None),
             gemini_basic_slot: RwLock::new(None),
@@ -152,6 +328,28 @@ impl AsarTelemetryHub {
             .store(enabled, Ordering::Relaxed);
     }
 
+    fn is_cross_family_fallback_enabled(&self) -> bool {
+        self.cross_family_fallback_enabled.load(Ordering::Relaxed)
+    }
+
+    fn set_cross_family_fallback(&self, enabled: bool) {
+        self.cross_family_fallback_enabled
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    fn is_separate_lite_slot_enabled(&self) -> bool {
+        self.separate_lite_slot.load(Ordering::Relaxed)
+    }
+
+    fn set_separate_lite_slot(&self, enabled: bool) {
+        self.separate_lite_slot.store(enabled, Ordering::Relaxed);
+        if !enabled {
+            if let Ok(mut map) = self.slots.write() {
+                map.remove("gemini_lite");
+            }
+        }
+    }
+
     fn record_fallback_route(&self, route: String) {
         self.fallback_downgrade_count
             .fetch_add(1, Ordering::Relaxed);
@@ -173,6 +371,9 @@ impl AsarTelemetryHub {
     }
 
     fn reset_slots(&self) {
+        if let Ok(mut map) = self.slots.write() {
+            map.clear();
+        }
         if let Ok(mut c) = self.claude_slot.write() {
             *c = None;
         }
@@ -182,6 +383,106 @@ impl AsarTelemetryHub {
         if let Ok(mut b) = self.gemini_basic_slot.write() {
             *b = None;
         }
+    }
+
+    fn get_slot_by_key(&self, slot_key: &str) -> Option<(String, String)> {
+        self.slots.read().ok().and_then(|map| {
+            map.get(slot_key)
+                .map(|s| (s.account_id.clone(), s.email.clone()))
+        })
+    }
+
+    fn set_slot_by_key(
+        &self,
+        slot_key: &'static str,
+        account_id: String,
+        email: String,
+        model: &str,
+    ) {
+        let now = chrono::Utc::now().timestamp();
+        let label = short_slot_model_label(model);
+        if let Ok(mut map) = self.slots.write() {
+            match map.get_mut(slot_key) {
+                Some(existing) if existing.account_id == account_id => {
+                    existing.email = email.clone();
+                    existing.last_used_ts = now;
+                    if !label.is_empty() && !existing.models.iter().any(|m| m == &label) {
+                        if existing.models.len() >= 4 {
+                            existing.models.remove(0);
+                        }
+                        existing.models.push(label);
+                    }
+                }
+                _ => {
+                    let models = if label.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![label]
+                    };
+                    map.insert(
+                        slot_key,
+                        SlotState {
+                            account_id: account_id.clone(),
+                            email: email.clone(),
+                            models,
+                            last_used_ts: now,
+                        },
+                    );
+                }
+            }
+        }
+        // Keep legacy fields synchronized
+        match slot_key {
+            "claude_full" | "claude_basic" => self.set_slot(true, account_id, email),
+            "gemini_full" => self.set_slot(false, account_id, email),
+            "gemini_basic" => self.set_gemini_basic_slot(account_id, email),
+            _ => {}
+        }
+    }
+
+    fn clear_slot_by_key_if_matches(&self, slot_key: &str, account_id: &str) {
+        if let Ok(mut map) = self.slots.write() {
+            if map
+                .get(slot_key)
+                .is_some_and(|s| s.account_id == account_id)
+            {
+                map.remove(slot_key);
+            }
+        }
+        match slot_key {
+            "claude_full" | "claude_basic" => self.clear_slot_if_matches(true, account_id),
+            "gemini_full" => self.clear_slot_if_matches(false, account_id),
+            "gemini_basic" => self.clear_gemini_basic_slot_if_matches(account_id),
+            _ => {}
+        }
+    }
+
+    fn active_slots_snapshot(&self) -> Vec<AsarActiveSlot> {
+        let Ok(map) = self.slots.read() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for key in SLOT_ORDER {
+            if let Some(s) = map.get(key) {
+                let (family, tier_kind) = slot_meta(key);
+                let in_flight = self
+                    .in_flight_by_account
+                    .get(&s.account_id)
+                    .map(|c| c.load(Ordering::Relaxed) as u64)
+                    .unwrap_or(0);
+                out.push(AsarActiveSlot {
+                    slot_key: key.to_string(),
+                    family: family.to_string(),
+                    tier_kind: tier_kind.to_string(),
+                    account_id: s.account_id.clone(),
+                    email: s.email.clone(),
+                    models: s.models.clone(),
+                    in_flight,
+                    last_used_ts: s.last_used_ts,
+                });
+            }
+        }
+        out
     }
 
     fn get_slot(&self, is_claude_track: bool) -> Option<(String, String)> {
@@ -235,14 +536,6 @@ impl AsarTelemetryHub {
         }
     }
 
-    /// Clear whichever slot(s) this account might be pinned in after a failover.
-    fn clear_active_slot(&self, is_claude_track: bool, is_gemini_basic: bool, account_id: &str) {
-        self.clear_slot_if_matches(is_claude_track, account_id);
-        if is_gemini_basic {
-            self.clear_gemini_basic_slot_if_matches(account_id);
-        }
-    }
-
     fn record_failover(&self) {
         self.failover_count.fetch_add(1, Ordering::Relaxed);
     }
@@ -274,25 +567,66 @@ impl AsarTelemetryHub {
             .map(|entry| entry.key().clone())
             .collect()
     }
+
+    fn active_streams_snapshot(&self) -> Vec<AsarInFlightStream> {
+        let Ok(guard) = self.active_streams.lock() else {
+            return Vec::new();
+        };
+        guard
+            .iter()
+            .map(|rec| AsarInFlightStream {
+                stream_id: rec.stream_id,
+                slot_key: rec.slot_key.clone(),
+                account_id: rec.account_id.clone(),
+                email: rec.email.clone(),
+                requested_model: rec.requested_model.clone(),
+                target_model: rec.target_model.clone(),
+                elapsed_ms: rec.started_at.elapsed().as_millis() as u64,
+            })
+            .collect()
+    }
 }
 
 static ASAR_TELEMETRY: Lazy<AsarTelemetryHub> = Lazy::new(AsarTelemetryHub::new);
 
 struct AsarInFlightGuard {
     account_id: Option<String>,
+    stream_id: Option<u64>,
 }
 
 impl AsarInFlightGuard {
-    fn acquire(account_id: Option<String>) -> Self {
+    fn acquire(
+        slot_key: &str,
+        account_id: String,
+        email: String,
+        requested_model: String,
+        target_model: String,
+    ) -> Self {
         ASAR_TELEMETRY.in_flight.fetch_add(1, Ordering::SeqCst);
-        if let Some(ref id) = account_id {
-            ASAR_TELEMETRY
-                .in_flight_by_account
-                .entry(id.clone())
-                .or_insert_with(|| AtomicUsize::new(0))
-                .fetch_add(1, Ordering::SeqCst);
+        ASAR_TELEMETRY
+            .in_flight_by_account
+            .entry(account_id.clone())
+            .or_insert_with(|| AtomicUsize::new(0))
+            .fetch_add(1, Ordering::SeqCst);
+        let stream_id = ASAR_TELEMETRY
+            .next_stream_id
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        if let Ok(mut guard) = ASAR_TELEMETRY.active_streams.lock() {
+            guard.push(ActiveStreamRecord {
+                stream_id,
+                slot_key: slot_key.to_string(),
+                account_id: account_id.clone(),
+                email,
+                requested_model,
+                target_model,
+                started_at: std::time::Instant::now(),
+            });
         }
-        Self { account_id }
+        Self {
+            account_id: Some(account_id),
+            stream_id: Some(stream_id),
+        }
     }
 }
 
@@ -302,6 +636,11 @@ impl Drop for AsarInFlightGuard {
         if let Some(ref id) = self.account_id {
             if let Some(counter) = ASAR_TELEMETRY.in_flight_by_account.get(id) {
                 counter.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        if let Some(sid) = self.stream_id {
+            if let Ok(mut guard) = ASAR_TELEMETRY.active_streams.lock() {
+                guard.retain(|rec| rec.stream_id != sid);
             }
         }
     }
@@ -319,6 +658,26 @@ pub fn set_equivalent_fallback_enabled(enabled: bool) {
     if let Err(e) = crate::modules::asar_patch::persist_equivalent_fallback_flag(enabled) {
         tracing::warn!(
             "[ASAR-Bridge] Failed to persist equivalent_fallback flag: {}",
+            e
+        );
+    }
+}
+
+pub fn set_cross_family_fallback_enabled(enabled: bool) {
+    ASAR_TELEMETRY.set_cross_family_fallback(enabled);
+    if let Err(e) = crate::modules::asar_patch::persist_cross_family_fallback_flag(enabled) {
+        tracing::warn!(
+            "[ASAR-Bridge] Failed to persist cross_family_fallback flag: {}",
+            e
+        );
+    }
+}
+
+pub fn set_separate_lite_slot_enabled(enabled: bool) {
+    ASAR_TELEMETRY.set_separate_lite_slot(enabled);
+    if let Err(e) = crate::modules::asar_patch::persist_separate_lite_slot_flag(enabled) {
+        tracing::warn!(
+            "[ASAR-Bridge] Failed to persist separate_lite_slot flag: {}",
             e
         );
     }
@@ -358,6 +717,9 @@ pub(crate) fn resolve_equivalent_fallback_model(target_model: &str) -> Option<St
     if lower.starts_with("claude-opus-5") {
         return Some("claude-opus-4-6-thinking".to_string());
     }
+    if lower == "claude-opus-4-6-thinking" {
+        return Some("claude-sonnet-4-6".to_string());
+    }
     if lower.starts_with("claude-sonnet-5") {
         return Some("claude-sonnet-4-6".to_string());
     }
@@ -365,6 +727,173 @@ pub(crate) fn resolve_equivalent_fallback_model(target_model: &str) -> Option<St
         return Some("gemini-4-hydrogen-high".to_string());
     }
     None
+}
+
+fn infer_gemini_tier_suffix(
+    requested_model: &str,
+    current_target: &str,
+    body_json: &Value,
+) -> &'static str {
+    let probe = if !requested_model.trim().is_empty() {
+        requested_model
+    } else {
+        current_target
+    };
+    let lower = probe.trim().to_ascii_lowercase();
+    if lower.ends_with("-low") {
+        return "-low";
+    }
+    if lower.ends_with("-xhigh") || lower.ends_with("-high") {
+        return "-high";
+    }
+    if lower.ends_with("-medium") {
+        return "-medium";
+    }
+    let thinking_level = body_json
+        .get("generationConfig")
+        .or_else(|| {
+            body_json
+                .get("request")
+                .and_then(|r| r.get("generationConfig"))
+        })
+        .and_then(|gc| gc.get("thinkingConfig"))
+        .and_then(|tc| tc.get("thinkingLevel"))
+        .and_then(Value::as_str);
+    if let Some(level) = thinking_level {
+        match level.trim().to_ascii_uppercase().as_str() {
+            "LOW" => return "-low",
+            "HIGH" | "XHIGH" => return "-high",
+            "MEDIUM" => return "-medium",
+            _ => {}
+        }
+    }
+    "-medium"
+}
+
+/// Multi-stage fallback selector:
+/// 1) Same-family equivalent downgrade (if `equivalent_enabled`),
+/// 2) Cross-family rescue (if `cross_family_enabled`): Claude/GPT-OSS -> Gemini Carbon -> Gemini Hydrogen,
+///    or interactive non-flash-lite Gemini -> Claude Sonnet 5.5 -> Claude Sonnet 4.6.
+pub(crate) fn resolve_next_fallback_model(
+    current_target: &str,
+    requested_model: &str,
+    body_json: &Value,
+    visited: &HashSet<String>,
+    equivalent_enabled: bool,
+    cross_family_enabled: bool,
+) -> Option<String> {
+    if equivalent_enabled {
+        if let Some(eq_model) = resolve_equivalent_fallback_model(current_target) {
+            let eq_lower = eq_model.to_ascii_lowercase();
+            if !eq_lower.eq_ignore_ascii_case(current_target) && !visited.contains(&eq_lower) {
+                return Some(eq_model);
+            }
+        }
+    }
+
+    if !cross_family_enabled {
+        return None;
+    }
+
+    let lower = current_target.trim().to_ascii_lowercase();
+    let lower = lower.strip_prefix("models/").unwrap_or(&lower);
+
+    if (lower.starts_with("claude-") || lower.starts_with("gpt-oss-"))
+        && !visited.iter().any(|m| m.starts_with("gemini-"))
+    {
+        let tier = infer_gemini_tier_suffix(requested_model, current_target, body_json);
+        let carbon = format!("gemini-4-carbon{}", tier);
+        if !visited.contains(&carbon) {
+            return Some(carbon);
+        }
+        let hydrogen = format!("gemini-4-hydrogen{}", tier);
+        if !visited.contains(&hydrogen) {
+            return Some(hydrogen);
+        }
+    } else if lower.starts_with("gemini-")
+        && !is_flash_lite_model(lower)
+        && !is_flash_lite_model(requested_model)
+        && !visited
+            .iter()
+            .any(|m| m.starts_with("claude-") || m.starts_with("gpt-oss-"))
+    {
+        if !visited.contains("claude-sonnet-5-5-medium") {
+            return Some("claude-sonnet-5-5-medium".to_string());
+        }
+        if !visited.contains("claude-sonnet-4-6") {
+            return Some("claude-sonnet-4-6".to_string());
+        }
+    }
+
+    None
+}
+
+fn sanitize_generation_config_for_target(gen_cfg: &mut Value, target_model: &str) {
+    let Some(gc) = gen_cfg.as_object_mut() else {
+        return;
+    };
+    let lower = target_model.trim().to_ascii_lowercase();
+    let lower = lower.strip_prefix("models/").unwrap_or(&lower);
+
+    if lower.starts_with("gemini-") {
+        if let Some(max_tok) = gc.get("maxOutputTokens").and_then(Value::as_u64) {
+            if max_tok > 65_536 {
+                gc.insert("maxOutputTokens".to_string(), json!(65_536));
+            }
+        }
+        if let Some(tc) = gc.get_mut("thinkingConfig").and_then(Value::as_object_mut) {
+            if let Some(level) = tc
+                .get("thinkingLevel")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            {
+                tc.remove("thinkingBudget");
+                let normalized = match level.trim().to_ascii_uppercase().as_str() {
+                    "LOW" => "LOW",
+                    "MEDIUM" => "MEDIUM",
+                    "HIGH" => "HIGH",
+                    "XHIGH" => {
+                        if lower.ends_with("-xhigh") {
+                            "XHIGH"
+                        } else {
+                            "HIGH"
+                        }
+                    }
+                    _ => "HIGH",
+                };
+                tc.insert("thinkingLevel".to_string(), json!(normalized));
+            }
+        }
+    } else if lower.starts_with("claude-") {
+        if let Some(max_tok) = gc.get("maxOutputTokens").and_then(Value::as_u64) {
+            if max_tok > 64_000 {
+                gc.insert("maxOutputTokens".to_string(), json!(64_000));
+            }
+        }
+        if lower == "claude-sonnet-4-6" {
+            gc.remove("thinkingConfig");
+        }
+    }
+}
+
+pub(crate) fn sanitize_body_for_fallback_target(
+    body_json: &mut Value,
+    target_model: &str,
+    client_session_id: Option<&str>,
+) {
+    rewrite_model_in_v1internal_body(body_json, target_model);
+    InboundThinkingPipeline::strip_signatures_for_retry(body_json, client_session_id, target_model);
+    InboundThinkingPipeline::sanitize_inbound_signatures(body_json, target_model);
+
+    if let Some(gc) = body_json.get_mut("generationConfig") {
+        sanitize_generation_config_for_target(gc, target_model);
+    }
+    if let Some(gc) = body_json
+        .get_mut("request")
+        .and_then(|r| r.get_mut("generationConfig"))
+    {
+        sanitize_generation_config_for_target(gc, target_model);
+    }
 }
 
 /// Sort key for `fetchAvailableModels` upstream account selection:
@@ -469,6 +998,7 @@ pub async fn snapshot_asar_telemetry(state: Option<&AppState>) -> AsarTelemetryS
     AsarTelemetrySnapshot {
         in_flight: ASAR_TELEMETRY.in_flight.load(Ordering::Relaxed),
         asar_in_flight_account_ids: ASAR_TELEMETRY.active_account_ids(),
+        in_flight_streams: ASAR_TELEMETRY.active_streams_snapshot(),
         total_requests: ASAR_TELEMETRY.total_requests.load(Ordering::Relaxed),
         failover_count: ASAR_TELEMETRY.failover_count.load(Ordering::Relaxed),
         total_input_tokens: ASAR_TELEMETRY.total_input_tokens.load(Ordering::Relaxed),
@@ -479,6 +1009,8 @@ pub async fn snapshot_asar_telemetry(state: Option<&AppState>) -> AsarTelemetryS
         last_active_model: last_active.as_ref().map(|r| r.model.clone()),
         last_active_timestamp: last_active.as_ref().map(|r| r.timestamp),
         dual_track_enabled: ASAR_TELEMETRY.is_dual_track_enabled(),
+        separate_lite_slot: ASAR_TELEMETRY.is_separate_lite_slot_enabled(),
+        active_slots: ASAR_TELEMETRY.active_slots_snapshot(),
         claude_slot_account_id: claude_slot.as_ref().map(|(id, _)| id.clone()),
         claude_slot_email: claude_slot.as_ref().map(|(_, email)| email.clone()),
         gemini_slot_account_id: gemini_slot.as_ref().map(|(id, _)| id.clone()),
@@ -488,6 +1020,7 @@ pub async fn snapshot_asar_telemetry(state: Option<&AppState>) -> AsarTelemetryS
         proxy_in_flight_account_ids,
         native_current_account_id,
         equivalent_fallback_enabled: ASAR_TELEMETRY.is_equivalent_fallback_enabled(),
+        cross_family_fallback_enabled: ASAR_TELEMETRY.is_cross_family_fallback_enabled(),
         fallback_downgrade_count: ASAR_TELEMETRY
             .fallback_downgrade_count
             .load(Ordering::Relaxed),
@@ -742,7 +1275,65 @@ async fn handle_fetch_available_models(
         .collect();
     let mut tried = HashSet::new();
 
-    // Try up to 5 healthy accounts in strict ULTRA > PRO > FREE tier order
+    // Try up to 5 accounts in richest-catalog-first order using metadata tokens (ignoring 0% chat quota / rate-limit)
+    for target_acc_id in ordered_ids.iter().take(5) {
+        if tried.contains(target_acc_id) {
+            continue;
+        }
+        match state
+            .token_manager
+            .get_metadata_token_by_id(target_acc_id)
+            .await
+        {
+            Ok((access_token, email, account_id)) => {
+                match state
+                    .upstream
+                    .call_v1_internal_raw_bytes(
+                        "fetchAvailableModels",
+                        &access_token,
+                        raw_req_body.clone(),
+                        incoming_ct.as_deref(),
+                        None,
+                        extra_headers.clone(),
+                        Some(&account_id),
+                    )
+                    .await
+                {
+                    Ok(call_res) if call_res.response.status().is_success() => {
+                        if let Ok(raw_text) = call_res.response.text().await {
+                            let _ =
+                                asar_model_catalog::ingest_live_fetch_available_models(&raw_text);
+                            let injected =
+                                asar_model_catalog::inject_models_into_fetch_response(&raw_text);
+                            return json_raw_ok(injected);
+                        }
+                    }
+                    Ok(call_res) => {
+                        let status = call_res.response.status().as_u16();
+                        tracing::warn!(
+                            "[ASAR-Bridge] fetchAvailableModels (metadata) upstream {} for {}, trying next account",
+                            status,
+                            email
+                        );
+                        tried.insert(account_id);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[ASAR-Bridge] fetchAvailableModels (metadata) error for {}: {}",
+                            email,
+                            e
+                        );
+                        tried.insert(account_id);
+                    }
+                }
+            }
+            Err(_) => {
+                // Will still be eligible for get_token_filtered fallback below
+            }
+        }
+    }
+
+    // Fallback: try healthy accounts via get_token_filtered in tier order
     for target_acc_id in ordered_ids.into_iter().take(5) {
         if tried.contains(&target_acc_id) {
             continue;
@@ -896,13 +1487,14 @@ async fn handle_v1internal_pool(
         InboundThinkingPipeline::sanitize_inbound_signatures(&mut body_json, &target_model);
     }
 
-    let quota_group = classify_quota_group(&target_model);
-    let is_claude_track = quota_group == "claude";
-    // Tri-slot tracks (only relevant when dual_track is on and this is an AI request):
-    // a) Claude track          → claude_slot
-    // b) Gemini Full track     → gemini_slot  (flagship canary: Carbon / Neon / Argon / Claude 5.5)
-    // c) Gemini Basic track    → gemini_basic_slot (Hydrogen, Flash, flash-lite — all non-flagship)
-    let mut is_gemini_basic_track = !is_claude_track && !is_flagship_canary_model(&target_model);
+    let mut quota_group = classify_quota_group(&target_model);
+    let mut is_claude_track = quota_group == "claude";
+    // 5-slot routing: claude_full, claude_basic, gemini_full, gemini_basic, gemini_lite
+    let mut slot_key = resolve_slot_key(
+        is_claude_track,
+        &target_model,
+        ASAR_TELEMETRY.is_separate_lite_slot_enabled(),
+    );
     let dual_track = is_ai_request && ASAR_TELEMETRY.is_dual_track_enabled();
 
     let client_session_id = headers
@@ -910,14 +1502,8 @@ async fn handle_v1internal_pool(
         .or_else(|| headers.get("x-vscode-sessionid"))
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let effective_session_id = if dual_track {
-        Some(if is_claude_track {
-            "asar_slot_claude".to_string()
-        } else if is_gemini_basic_track {
-            "asar_slot_gemini_basic".to_string()
-        } else {
-            "asar_slot_gemini".to_string()
-        })
+    let mut effective_session_id = if dual_track {
+        Some(format!("asar_slot_{}", slot_key))
     } else {
         client_session_id.clone()
     };
@@ -937,15 +1523,22 @@ async fn handle_v1internal_pool(
     let mut last_error_status = StatusCode::SERVICE_UNAVAILABLE;
     let mut last_error_body = String::from("No available accounts in Google Account Pool");
 
-    let mut fallback_used = false;
+    const MAX_FALLBACK_HOPS: usize = 3;
+    let mut fallback_hops: usize = 0;
+    let mut visited_models: HashSet<String> = HashSet::new();
+    visited_models.insert(target_model.to_ascii_lowercase());
+    let mut fallback_chain = if !requested_model.trim().is_empty() {
+        requested_model.clone()
+    } else {
+        target_model.clone()
+    };
 
     'fallback_pass: loop {
         for _attempt in 0..max_account_attempts {
             let token_res = select_account_for_request(
                 &state,
                 quota_group,
-                is_claude_track,
-                is_gemini_basic_track,
+                slot_key,
                 dual_track,
                 force_rotate,
                 effective_session_id.as_deref(),
@@ -990,7 +1583,13 @@ async fn handle_v1internal_pool(
 
                 let ttfb_secs = adaptive_ttfb_timeout_secs(&target_model, &req_body, body_len);
                 let in_flight_guard = if is_ai_request {
-                    Some(AsarInFlightGuard::acquire(Some(account_id.clone())))
+                    Some(AsarInFlightGuard::acquire(
+                        slot_key,
+                        account_id.clone(),
+                        email.clone(),
+                        requested_model.clone(),
+                        target_model.clone(),
+                    ))
                 } else {
                     None
                 };
@@ -1017,11 +1616,7 @@ async fn handle_v1internal_pool(
                         );
                         ASAR_TELEMETRY.record_failover();
                         if dual_track {
-                            ASAR_TELEMETRY.clear_active_slot(
-                                is_claude_track,
-                                is_gemini_basic_track,
-                                &account_id,
-                            );
+                            ASAR_TELEMETRY.clear_slot_by_key_if_matches(slot_key, &account_id);
                         }
                         last_error_status = StatusCode::GATEWAY_TIMEOUT;
                         last_error_body =
@@ -1040,11 +1635,7 @@ async fn handle_v1internal_pool(
                         );
                         ASAR_TELEMETRY.record_failover();
                         if dual_track {
-                            ASAR_TELEMETRY.clear_active_slot(
-                                is_claude_track,
-                                is_gemini_basic_track,
-                                &account_id,
-                            );
+                            ASAR_TELEMETRY.clear_slot_by_key_if_matches(slot_key, &account_id);
                         }
                         last_error_status = StatusCode::BAD_GATEWAY;
                         last_error_body = e;
@@ -1061,22 +1652,13 @@ async fn handle_v1internal_pool(
                     state.token_manager.mark_account_success(&account_id);
                     if is_ai_request {
                         ASAR_TELEMETRY.record_active_guarded(&account_id, &email, &target_model);
-                        // Background `*-flash-lite*` micro-calls must never pin the Gemini Worker slot.
-                        // Tri-slot routing: Basic Gemini track → gemini_basic_slot;
-                        //                  Gemini Full track   → gemini_slot (flagship canary only);
-                        //                  Claude track        → claude_slot.
                         if dual_track {
-                            if is_gemini_basic_track {
-                                // flash-lite is allowed to pin gemini_basic_slot (it IS a basic call)
-                                ASAR_TELEMETRY
-                                    .set_gemini_basic_slot(account_id.clone(), email.clone());
-                            } else if !is_flash_lite_model(&target_model) {
-                                ASAR_TELEMETRY.set_slot(
-                                    is_claude_track,
-                                    account_id.clone(),
-                                    email.clone(),
-                                );
-                            }
+                            ASAR_TELEMETRY.set_slot_by_key(
+                                slot_key,
+                                account_id.clone(),
+                                email.clone(),
+                                &target_model,
+                            );
                         }
                     }
 
@@ -1219,11 +1801,7 @@ async fn handle_v1internal_pool(
                     );
                     ASAR_TELEMETRY.record_failover();
                     if dual_track {
-                        ASAR_TELEMETRY.clear_active_slot(
-                            is_claude_track,
-                            is_gemini_basic_track,
-                            &account_id,
-                        );
+                        ASAR_TELEMETRY.clear_slot_by_key_if_matches(slot_key, &account_id);
                     }
                     state
                         .token_manager
@@ -1307,11 +1885,7 @@ async fn handle_v1internal_pool(
                     }
                     ASAR_TELEMETRY.record_failover();
                     if dual_track {
-                        ASAR_TELEMETRY.clear_active_slot(
-                            is_claude_track,
-                            is_gemini_basic_track,
-                            &account_id,
-                        );
+                        ASAR_TELEMETRY.clear_slot_by_key_if_matches(slot_key, &account_id);
                     }
                     tried_accounts.insert(account_id.clone());
                     force_rotate = true;
@@ -1326,11 +1900,7 @@ async fn handle_v1internal_pool(
                     );
                     ASAR_TELEMETRY.record_failover();
                     if dual_track {
-                        ASAR_TELEMETRY.clear_active_slot(
-                            is_claude_track,
-                            is_gemini_basic_track,
-                            &account_id,
-                        );
+                        ASAR_TELEMETRY.clear_slot_by_key_if_matches(slot_key, &account_id);
                     }
                     tried_accounts.insert(account_id.clone());
                     force_rotate = true;
@@ -1372,11 +1942,7 @@ async fn handle_v1internal_pool(
                 if status == StatusCode::NOT_FOUND {
                     ASAR_TELEMETRY.record_failover();
                     if dual_track {
-                        ASAR_TELEMETRY.clear_active_slot(
-                            is_claude_track,
-                            is_gemini_basic_track,
-                            &account_id,
-                        );
+                        ASAR_TELEMETRY.clear_slot_by_key_if_matches(slot_key, &account_id);
                     }
                     state.token_manager.mark_model_unsupported(
                         &account_id,
@@ -1411,34 +1977,49 @@ async fn handle_v1internal_pool(
             }
         }
 
-        // Layer 3 — Graceful Equivalent Model Fallback: every account failed for the flagship
-        // canary model, so serve this single turn from its Basic equivalent (Carbon/Neon/Argon ->
-        // Hydrogen, Claude 5.5 -> 4.6) without changing the model shown in the IDE.
-        if !fallback_used && is_ai_request && ASAR_TELEMETRY.is_equivalent_fallback_enabled() {
-            if let Some(fallback_model) = resolve_equivalent_fallback_model(&target_model) {
-                if !fallback_model.eq_ignore_ascii_case(&target_model) {
-                    tracing::warn!(
-                        "[ASAR-Bridge] All accounts failed for {}; equivalent fallback -> {}",
-                        target_model,
-                        fallback_model
-                    );
-                    ASAR_TELEMETRY
-                        .record_fallback_route(format!("{} -> {}", target_model, fallback_model));
-                    rewrite_model_in_v1internal_body(&mut body_json, &fallback_model);
-                    InboundThinkingPipeline::strip_signatures_for_retry(
-                        &mut body_json,
-                        client_session_id.as_deref(),
-                        &fallback_model,
-                    );
-                    target_model = fallback_model;
-                    // Recalculate tri-slot track after model rewrite (Carbon → Hydrogen becomes Basic)
-                    is_gemini_basic_track =
-                        !is_claude_track && !is_flagship_canary_model(&target_model);
-                    tried_accounts.clear();
-                    force_rotate = false;
-                    fallback_used = true;
-                    continue 'fallback_pass;
+        // Layer 3 — Multi-Stage Fallback Cascade + Cross-Family Rescue:
+        // Hop 1: Same-family equivalent (Carbon/Neon/Argon -> Hydrogen, Claude 5.5 -> 4.6, Opus 4.6 -> Sonnet 4.6)
+        // Hop 2 & 3: Cross-family rescue (Claude/GPT <-> Gemini Carbon -> Gemini Hydrogen)
+        if is_ai_request && fallback_hops < MAX_FALLBACK_HOPS {
+            if let Some(next_model) = resolve_next_fallback_model(
+                &target_model,
+                &requested_model,
+                &body_json,
+                &visited_models,
+                ASAR_TELEMETRY.is_equivalent_fallback_enabled(),
+                ASAR_TELEMETRY.is_cross_family_fallback_enabled(),
+            ) {
+                tracing::warn!(
+                    "[ASAR-Bridge] All accounts failed for {}; fallback hop {} -> {}",
+                    target_model,
+                    fallback_hops + 1,
+                    next_model
+                );
+                fallback_chain = format!("{} -> {}", fallback_chain, next_model);
+                ASAR_TELEMETRY.record_fallback_route(fallback_chain.clone());
+
+                sanitize_body_for_fallback_target(
+                    &mut body_json,
+                    &next_model,
+                    client_session_id.as_deref(),
+                );
+                target_model = next_model;
+                visited_models.insert(target_model.to_ascii_lowercase());
+
+                quota_group = classify_quota_group(&target_model);
+                is_claude_track = quota_group == "claude";
+                slot_key = resolve_slot_key(
+                    is_claude_track,
+                    &target_model,
+                    ASAR_TELEMETRY.is_separate_lite_slot_enabled(),
+                );
+                if dual_track {
+                    effective_session_id = Some(format!("asar_slot_{}", slot_key));
                 }
+                tried_accounts.clear();
+                force_rotate = false;
+                fallback_hops += 1;
+                continue 'fallback_pass;
             }
         }
         break;
@@ -1459,19 +2040,43 @@ async fn handle_v1internal_pool(
         audit_req_body,
     );
 
-    Response::builder()
-        .status(last_error_status)
-        .header(axum::http::header::CONTENT_TYPE, "application/json")
-        .body(Body::from(last_error_body))
-        .unwrap_or_else(|_| StatusCode::SERVICE_UNAVAILABLE.into_response())
+    if let Ok(parsed) = serde_json::from_str::<Value>(&last_error_body) {
+        if parsed.is_object() && parsed.get("error").is_some() {
+            return Response::builder()
+                .status(last_error_status)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(last_error_body))
+                .unwrap_or_else(|_| StatusCode::SERVICE_UNAVAILABLE.into_response());
+        }
+    }
+
+    let rpc_status = match last_error_status {
+        StatusCode::TOO_MANY_REQUESTS => "RESOURCE_EXHAUSTED",
+        StatusCode::BAD_REQUEST => "INVALID_ARGUMENT",
+        StatusCode::UNAUTHORIZED => "UNAUTHENTICATED",
+        StatusCode::FORBIDDEN => "PERMISSION_DENIED",
+        StatusCode::NOT_FOUND => "NOT_FOUND",
+        StatusCode::GATEWAY_TIMEOUT => "DEADLINE_EXCEEDED",
+        _ => "UNAVAILABLE",
+    };
+    (
+        last_error_status,
+        axum::Json(json!({
+            "error": {
+                "code": last_error_status.as_u16(),
+                "message": last_error_body,
+                "status": rpc_status,
+            }
+        })),
+    )
+        .into_response()
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn select_account_for_request(
     state: &AppState,
     quota_group: &str,
-    is_claude_track: bool,
-    is_gemini_basic_track: bool,
+    slot_key: &str,
     dual_track: bool,
     force_rotate: bool,
     session_id: Option<&str>,
@@ -1479,8 +2084,39 @@ async fn select_account_for_request(
     pool_len: usize,
     tried_accounts: &HashSet<String>,
 ) -> Result<(String, String, String, String, u64), String> {
-    // 0. Layer 2 — Capability-Tiered Burn Order: common (non-flagship) models burn Basic accounts
-    // first and keep Full accounts (Carbon / Neon / Argon / Claude 5.5) in reserve.
+    // 1. If Dual-Track is active and this slot already has a pinned healthy account, prefer it first
+    //    (preserves 99% prompt-cache across all 5 slots: claude_full, claude_basic, gemini_full, gemini_basic, gemini_lite).
+    if dual_track && !force_rotate {
+        if let Some((slot_acc_id, _slot_email)) = ASAR_TELEMETRY.get_slot_by_key(slot_key) {
+            if !tried_accounts.contains(&slot_acc_id) {
+                let mut exclude_others: HashSet<String> = state
+                    .token_manager
+                    .enabled_account_ids()
+                    .into_iter()
+                    .filter(|id| id != &slot_acc_id)
+                    .collect();
+                exclude_others.extend(tried_accounts.iter().cloned());
+
+                if let Ok(tuple) = get_token_with_25_fallback(
+                    state,
+                    quota_group,
+                    false,
+                    session_id,
+                    target_model,
+                    &exclude_others,
+                )
+                .await
+                {
+                    return Ok(tuple);
+                } else {
+                    ASAR_TELEMETRY.clear_slot_by_key_if_matches(slot_key, &slot_acc_id);
+                }
+            }
+        }
+    }
+
+    // 2. Layer 2 — Capability-Tiered Burn Order: common (non-flagship) models burn Basic accounts
+    //    first and keep Full accounts (Carbon / Neon / Argon / Claude 5.5) in reserve.
     if !is_flagship_canary_model(target_model) {
         let enabled_ids = state.token_manager.enabled_account_ids();
         let canary_ids: HashSet<String> = enabled_ids
@@ -1515,70 +2151,11 @@ async fn select_account_for_request(
         }
     }
 
-    // 1a. Gemini Basic track — check gemini_basic_slot FIRST (preserves 99% prompt-cache for
-    //     Hydrogen / Flash / flash-lite by never spraying across all 6 Basic accounts at once).
-    if dual_track && is_gemini_basic_track && !force_rotate {
-        if let Some((basic_slot_id, _)) = ASAR_TELEMETRY.get_gemini_basic_slot() {
-            if !tried_accounts.contains(&basic_slot_id) {
-                let mut exclude_others: HashSet<String> = state
-                    .token_manager
-                    .enabled_account_ids()
-                    .into_iter()
-                    .filter(|id| id != &basic_slot_id)
-                    .collect();
-                exclude_others.extend(tried_accounts.iter().cloned());
-
-                if let Ok(tuple) = get_token_with_25_fallback(
-                    state,
-                    quota_group,
-                    false,
-                    session_id,
-                    target_model,
-                    &exclude_others,
-                )
-                .await
-                {
-                    return Ok(tuple);
-                } else {
-                    ASAR_TELEMETRY.clear_gemini_basic_slot_if_matches(&basic_slot_id);
-                }
-            }
-        }
-    }
-
-    // 1b. If Dual-Track is active and this track (Claude / Gemini Full) already has a pinned
-    //     healthy slot, prefer it first.
-    if dual_track && !is_gemini_basic_track && !force_rotate {
-        if let Some((slot_acc_id, _slot_email)) = ASAR_TELEMETRY.get_slot(is_claude_track) {
-            if !tried_accounts.contains(&slot_acc_id) {
-                let mut exclude_others: HashSet<String> = state
-                    .token_manager
-                    .enabled_account_ids()
-                    .into_iter()
-                    .filter(|id| id != &slot_acc_id)
-                    .collect();
-                exclude_others.extend(tried_accounts.iter().cloned());
-
-                if let Ok(tuple) = get_token_with_25_fallback(
-                    state,
-                    quota_group,
-                    false,
-                    session_id,
-                    target_model,
-                    &exclude_others,
-                )
-                .await
-                {
-                    return Ok(tuple);
-                } else {
-                    ASAR_TELEMETRY.clear_slot_if_matches(is_claude_track, &slot_acc_id);
-                }
-            }
-        }
-    }
-
-    // 2. On Gemini worker track, avoid burning the pinned Claude Lead account when >1 accounts exist
-    let claude_slot_id = ASAR_TELEMETRY.get_slot(true).map(|(id, _)| id);
+    // 3. On Gemini worker track, avoid burning the pinned Claude Lead account when >1 accounts exist
+    let claude_slot_id = ASAR_TELEMETRY
+        .get_slot_by_key("claude_full")
+        .or_else(|| ASAR_TELEMETRY.get_slot_by_key("claude_basic"))
+        .map(|(id, _)| id);
     if let Some(exclusions_with_claude_lead) = build_dual_track_initial_exclusions(
         dual_track,
         quota_group,
@@ -1600,7 +2177,7 @@ async fn select_account_for_request(
         }
     }
 
-    // 3. Standard pool selection (including fallback to Claude Lead if no other Gemini account is available)
+    // 4. Standard pool selection (including fallback to Claude Lead if no other Gemini account is available)
     get_token_with_25_fallback(
         state,
         quota_group,
@@ -2597,6 +3174,157 @@ mod tests {
     }
 
     #[test]
+    fn test_multi_stage_cross_family_fallback_cascade() {
+        let req_body = json!({
+            "model": "claude-sonnet-5-5-high",
+            "request": {
+                "model": "claude-sonnet-5-5-high",
+                "generationConfig": {
+                    "maxOutputTokens": 128000,
+                    "thinkingConfig": {
+                        "includeThoughts": true,
+                        "thinkingLevel": "HIGH"
+                    }
+                }
+            }
+        });
+
+        let mut visited = HashSet::new();
+        let mut current = "claude-sonnet-5-5-high".to_string();
+        visited.insert(current.to_ascii_lowercase());
+
+        // Hop 1: claude-sonnet-5-5-high -> claude-sonnet-4-6
+        let hop1 = resolve_next_fallback_model(
+            &current,
+            "claude-sonnet-5-5-high",
+            &req_body,
+            &visited,
+            true,
+            true,
+        )
+        .expect("hop 1 expected");
+        assert_eq!(hop1, "claude-sonnet-4-6");
+        visited.insert(hop1.to_ascii_lowercase());
+        current = hop1;
+
+        // Hop 2: claude-sonnet-4-6 -> gemini-4-carbon-high
+        let hop2 = resolve_next_fallback_model(
+            &current,
+            "claude-sonnet-5-5-high",
+            &req_body,
+            &visited,
+            true,
+            true,
+        )
+        .expect("hop 2 expected");
+        assert_eq!(hop2, "gemini-4-carbon-high");
+        visited.insert(hop2.to_ascii_lowercase());
+        current = hop2;
+
+        // Hop 3: gemini-4-carbon-high -> gemini-4-hydrogen-high
+        let hop3 = resolve_next_fallback_model(
+            &current,
+            "claude-sonnet-5-5-high",
+            &req_body,
+            &visited,
+            true,
+            true,
+        )
+        .expect("hop 3 expected");
+        assert_eq!(hop3, "gemini-4-hydrogen-high");
+        visited.insert(hop3.to_ascii_lowercase());
+        current = hop3;
+
+        // No 4th hop back to claude-sonnet-5-5 or claude-sonnet-4-6 (already visited)
+        assert!(resolve_next_fallback_model(
+            &current,
+            "claude-sonnet-5-5-high",
+            &req_body,
+            &visited,
+            true,
+            true,
+        )
+        .is_none());
+
+        // Background flash-lite never crosses into Claude
+        let empty_visited = HashSet::new();
+        assert!(resolve_next_fallback_model(
+            "gemini-3.5-flash-lite",
+            "gemini-3.5-flash-lite",
+            &json!({}),
+            &empty_visited,
+            true,
+            true,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_sanitize_body_for_fallback_target_clamps_tokens_and_thinking() {
+        let mut gemini_body = json!({
+            "model": "claude-sonnet-5-5-high",
+            "generationConfig": {
+                "maxOutputTokens": 128000,
+                "thinkingConfig": {
+                    "includeThoughts": true,
+                    "thinkingLevel": "XHIGH",
+                    "thinkingBudget": 16000
+                }
+            },
+            "request": {
+                "model": "claude-sonnet-5-5-high",
+                "generationConfig": {
+                    "maxOutputTokens": 128000,
+                    "thinkingConfig": {
+                        "includeThoughts": true,
+                        "thinkingLevel": "HIGH",
+                        "thinkingBudget": 16000
+                    }
+                }
+            }
+        });
+
+        sanitize_body_for_fallback_target(&mut gemini_body, "gemini-4-carbon-high", None);
+        assert_eq!(gemini_body["model"], "gemini-4-carbon-high");
+        assert_eq!(gemini_body["request"]["model"], "gemini-4-carbon-high");
+        assert_eq!(gemini_body["generationConfig"]["maxOutputTokens"], 65536);
+        assert_eq!(
+            gemini_body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "HIGH"
+        );
+        assert!(gemini_body["generationConfig"]["thinkingConfig"]
+            .get("thinkingBudget")
+            .is_none());
+        assert_eq!(
+            gemini_body["request"]["generationConfig"]["maxOutputTokens"],
+            65536
+        );
+
+        let mut claude_46_body = json!({
+            "model": "claude-sonnet-5-5-high",
+            "request": {
+                "model": "claude-sonnet-5-5-high",
+                "generationConfig": {
+                    "maxOutputTokens": 128000,
+                    "thinkingConfig": {
+                        "includeThoughts": true,
+                        "thinkingLevel": "HIGH"
+                    }
+                }
+            }
+        });
+        sanitize_body_for_fallback_target(&mut claude_46_body, "claude-sonnet-4-6", None);
+        assert_eq!(claude_46_body["request"]["model"], "claude-sonnet-4-6");
+        assert_eq!(
+            claude_46_body["request"]["generationConfig"]["maxOutputTokens"],
+            64000
+        );
+        assert!(claude_46_body["request"]["generationConfig"]
+            .get("thinkingConfig")
+            .is_none());
+    }
+
+    #[test]
     fn test_audit_request_body_and_millis_timestamp() {
         // Timestamp must be Unix epoch in milliseconds (> 1_700_000_000_000), matching monitor.rs
         let ts = current_log_timestamp_millis();
@@ -2865,5 +3593,119 @@ mod tests {
             resolve_equivalent_fallback_model("models/gemini-pro-orchestrator-argon").as_deref(),
             Some("gemini-4-hydrogen-high")
         );
+    }
+
+    #[test]
+    fn test_five_slot_routing_and_active_slots_snapshot() {
+        assert_eq!(
+            resolve_slot_key(true, "claude-opus-5-5-high", true),
+            "claude_full"
+        );
+        assert_eq!(
+            resolve_slot_key(true, "claude-sonnet-4-6", true),
+            "claude_basic"
+        );
+        assert_eq!(
+            resolve_slot_key(false, "gemini-4-carbon-medium", true),
+            "gemini_full"
+        );
+        assert_eq!(
+            resolve_slot_key(false, "gemini-4-hydrogen-high", true),
+            "gemini_basic"
+        );
+        assert_eq!(
+            resolve_slot_key(false, "gemini-3.5-flash-lite", true),
+            "gemini_lite"
+        );
+        assert_eq!(
+            resolve_slot_key(false, "gemini-3.5-flash-lite", false),
+            "gemini_basic"
+        );
+
+        assert_eq!(short_slot_model_label("gemini-4-carbon-medium"), "Carbon");
+        assert_eq!(short_slot_model_label("gemini-4-neon-high"), "Neon");
+        assert_eq!(short_slot_model_label("gemini-4-hydrogen-high"), "Hydrogen");
+        assert_eq!(
+            short_slot_model_label("gemini-3.8-flash-medium"),
+            "3.8 Flash"
+        );
+        assert_eq!(
+            short_slot_model_label("gemini-3.5-flash-lite"),
+            "3.5 Flash Lite"
+        );
+        assert_eq!(short_slot_model_label("claude-opus-5-5-high"), "Opus 5.5");
+        assert_eq!(short_slot_model_label("claude-sonnet-4-6"), "Sonnet 4.6");
+
+        let hub = AsarTelemetryHub::new();
+        hub.set_slot_by_key(
+            "gemini_full",
+            "acc-full".to_string(),
+            "full@x.com".to_string(),
+            "gemini-4-carbon-medium",
+        );
+        hub.set_slot_by_key(
+            "gemini_full",
+            "acc-full".to_string(),
+            "full@x.com".to_string(),
+            "gemini-4-neon-high",
+        );
+        hub.set_slot_by_key(
+            "gemini_basic",
+            "acc-basic".to_string(),
+            "basic@x.com".to_string(),
+            "gemini-4-hydrogen-high",
+        );
+        hub.set_slot_by_key(
+            "claude_full",
+            "acc-claude".to_string(),
+            "claude@x.com".to_string(),
+            "claude-sonnet-5-5-medium",
+        );
+
+        let slots = hub.active_slots_snapshot();
+        assert_eq!(slots.len(), 3);
+        assert_eq!(slots[0].slot_key, "claude_full");
+        assert_eq!(slots[0].models, vec!["Sonnet 5.5"]);
+        assert_eq!(slots[1].slot_key, "gemini_full");
+        assert_eq!(slots[1].models, vec!["Carbon", "Neon"]);
+        assert_eq!(slots[2].slot_key, "gemini_basic");
+        assert_eq!(slots[2].models, vec!["Hydrogen"]);
+
+        // Rotating gemini_full to a new account resets its model list
+        hub.set_slot_by_key(
+            "gemini_full",
+            "acc-full-2".to_string(),
+            "full2@x.com".to_string(),
+            "gemini-4-argon-high",
+        );
+        let slots2 = hub.active_slots_snapshot();
+        assert_eq!(slots2[1].account_id, "acc-full-2");
+        assert_eq!(slots2[1].models, vec!["Argon"]);
+    }
+
+    #[test]
+    fn test_in_flight_guard_registers_and_drops_stream() {
+        let before = ASAR_TELEMETRY.active_streams_snapshot().len();
+        {
+            let _guard = AsarInFlightGuard::acquire(
+                "gemini_full",
+                "acc-stream-test".to_string(),
+                "stream@x.com".to_string(),
+                "gemini-4-carbon-medium".to_string(),
+                "gemini-4-carbon-medium".to_string(),
+            );
+            let during = ASAR_TELEMETRY.active_streams_snapshot();
+            assert_eq!(during.len(), before + 1);
+            let rec = during
+                .iter()
+                .find(|s| s.account_id == "acc-stream-test")
+                .expect("stream record present while guard is alive");
+            assert_eq!(rec.slot_key, "gemini_full");
+            assert_eq!(rec.email, "stream@x.com");
+            assert_eq!(rec.requested_model, "gemini-4-carbon-medium");
+            assert_eq!(rec.target_model, "gemini-4-carbon-medium");
+        }
+        let after = ASAR_TELEMETRY.active_streams_snapshot();
+        assert!(!after.iter().any(|s| s.account_id == "acc-stream-test"));
     }
 }

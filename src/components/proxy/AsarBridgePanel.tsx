@@ -35,12 +35,15 @@ import {
     getCatalogPath,
     listCatalogModels,
     patchAsar,
+    refreshIdeModels,
     reloadCatalogModels,
     resetAsarSlots,
     saveCatalogModels,
     setAsarBridgePort,
+    setAsarCrossFamilyFallback,
     setAsarDualTrack,
     setAsarEquivalentFallback,
+    setAsarSeparateLiteSlot,
     startAsarBridge,
     stopAsarBridge,
     syncCatalogFromAccounts,
@@ -153,7 +156,7 @@ export default function AsarBridgePanel() {
                 // Ignore transient polling errors
             }
         };
-        const timer = setInterval(pollTelemetry, 2500);
+        const timer = setInterval(pollTelemetry, 1500);
         return () => {
             cancelled = true;
             clearInterval(timer);
@@ -191,6 +194,46 @@ export default function AsarBridgePanel() {
                 enabled
                     ? t('proxy.asar.fallback_on', { defaultValue: 'Auto-Fallback enabled' })
                     : t('proxy.asar.fallback_off', { defaultValue: 'Auto-Fallback disabled' }),
+                'success',
+            );
+        } catch (error) {
+            showToast(String(error), 'error');
+        } finally {
+            setActionLoading(null);
+        }
+    };
+
+    const handleToggleCrossFamilyFallback = async (enabled: boolean) => {
+        setActionLoading('cross-family-fallback');
+        try {
+            const snap = await setAsarCrossFamilyFallback(enabled);
+            setTelemetry(snap);
+            showToast(
+                enabled
+                    ? t('proxy.asar.cross_family_on', {
+                          defaultValue: 'Đã bật cứu hộ chéo Claude ↔ Gemini',
+                      })
+                    : t('proxy.asar.cross_family_off', {
+                          defaultValue: 'Đã tắt cứu hộ chéo Claude ↔ Gemini',
+                      }),
+                'success',
+            );
+        } catch (error) {
+            showToast(String(error), 'error');
+        } finally {
+            setActionLoading(null);
+        }
+    };
+
+    const handleToggleSeparateLiteSlot = async (enabled: boolean) => {
+        setActionLoading('separate-lite');
+        try {
+            const snap = await setAsarSeparateLiteSlot(enabled);
+            setTelemetry(snap);
+            showToast(
+                enabled
+                    ? t('proxy.asar.separate_lite_on', { defaultValue: 'Đã bật tách riêng luồng cho model nền (3.5 Flash Lite)' })
+                    : t('proxy.asar.separate_lite_off', { defaultValue: 'Đã tắt tách riêng luồng 3.5 Flash Lite' }),
                 'success',
             );
         } catch (error) {
@@ -375,6 +418,25 @@ export default function AsarBridgePanel() {
                         added > 0
                             ? `Synced ${added} new model(s) from accounts`
                             : `Catalog up to date (${models.length} models)`,
+                }),
+                'success',
+            );
+        } catch (error) {
+            showToast(String(error), 'error');
+        } finally {
+            setActionLoading(null);
+        }
+    };
+
+    const handleRefreshIdeModels = async () => {
+        setActionLoading('refresh-ide-models');
+        try {
+            await refreshIdeModels();
+            const models = await listCatalogModels();
+            setCatalogModels(models);
+            showToast(
+                t('proxy.asar.ide_models_refreshed', {
+                    defaultValue: 'Đã đồng bộ Full Model & làm mới danh sách model trong Antigravity IDE',
                 }),
                 'success',
             );
@@ -695,9 +757,99 @@ export default function AsarBridgePanel() {
                     </button>
                 </div>
 
-                {/* Dual-Track Control Bar */}
-                <div className="pt-2.5 border-t border-emerald-200/60 dark:border-emerald-900/40 flex flex-wrap items-center justify-between gap-3">
-                    <div className="flex flex-wrap items-center gap-3">
+                {/* Section A: Live Concurrent Streams */}
+                <div className="pt-2.5 border-t border-emerald-200/60 dark:border-emerald-900/40 space-y-1.5">
+                    {(telemetry?.in_flight_streams?.length ?? 0) > 0 ? (
+                        <>
+                            <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-700 dark:text-emerald-300">
+                                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping shrink-0" />
+                                <span>🟢 Đang chạy trực tiếp ({telemetry!.in_flight_streams!.length} luồng)</span>
+                            </div>
+                            <div className="flex flex-col gap-1 rounded-lg bg-white/70 dark:bg-base-100/70 border border-emerald-200/60 dark:border-emerald-900/40 p-2 text-[11px]">
+                                {telemetry!.in_flight_streams!.map((stream) => {
+                                    const modelText =
+                                        stream.requested_model && stream.requested_model !== stream.target_model
+                                            ? `${stream.requested_model} → ${stream.target_model}`
+                                            : stream.target_model;
+                                    return (
+                                        <div
+                                            key={stream.stream_id}
+                                            className="flex items-center justify-between gap-2"
+                                        >
+                                            <div className="flex items-center gap-1.5 min-w-0">
+                                                <span className="text-emerald-500 shrink-0">●</span>
+                                                <span className="font-mono font-bold text-gray-800 dark:text-gray-200 truncate">
+                                                    {stream.email}
+                                                </span>
+                                                <span className="px-1.5 py-0.5 rounded bg-emerald-100/80 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 font-mono text-[10px] shrink-0">
+                                                    [{modelText}]
+                                                </span>
+                                            </div>
+                                            <span className="font-mono text-[10.5px] text-gray-500 dark:text-gray-400 shrink-0">
+                                                {Math.max(1, Math.round(stream.elapsed_ms / 1000))}s
+                                            </span>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        </>
+                    ) : (
+                        <div className="flex items-center gap-2 text-xs">
+                            <span className="text-gray-500 dark:text-gray-400">⚡ Gần nhất:</span>
+                            <span className="font-mono font-semibold text-emerald-700 dark:text-emerald-300">
+                                {telemetry?.last_active_email || 'Auto'}
+                            </span>
+                            {telemetry?.last_active_model && (
+                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-100/80 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300">
+                                    [{telemetry.last_active_model}]
+                                </span>
+                            )}
+                        </div>
+                    )}
+                </div>
+
+                {/* Multi-Slot Live Matrix & Detailed Track Settings */}
+                <div className="pt-2.5 border-t border-emerald-200/60 dark:border-emerald-900/40 space-y-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-xs font-bold text-gray-800 dark:text-gray-200 inline-flex items-center gap-1.5">
+                            <GitBranch size={13} className="text-emerald-500" />
+                            {t('proxy.asar.track_settings_title', {
+                                defaultValue: '⚙️ Cấu hình phân luồng chi tiết & Multi-Slot Live',
+                            })}
+                        </span>
+                        <div className="flex items-center gap-1.5">
+                            <button
+                                type="button"
+                                onClick={handleRefreshIdeModels}
+                                disabled={actionLoading !== null}
+                                className={BTN_PRIMARY_EMERALD}
+                                title={t('proxy.asar.refresh_ide_models_tooltip', {
+                                    defaultValue: 'Đồng bộ Full Model từ pool và đẩy ngay vào Antigravity IDE',
+                                })}
+                            >
+                                <RefreshCw
+                                    size={12}
+                                    className={actionLoading === 'refresh-ide-models' ? 'animate-spin' : ''}
+                                />
+                                {actionLoading === 'refresh-ide-models'
+                                    ? t('proxy.asar.refreshing_ide_models', { defaultValue: 'Đang nạp...' })
+                                    : t('proxy.asar.refresh_ide_models', { defaultValue: 'Nạp Model IDE' })}
+                            </button>
+                            {dualTrackEnabled && (
+                                <button
+                                    type="button"
+                                    onClick={handleResetSlots}
+                                    disabled={actionLoading === 'reset-slots'}
+                                    className={BTN_SECONDARY}
+                                >
+                                    <RotateCcw size={12} />
+                                    {t('proxy.asar.reset_slots', { defaultValue: 'Reset Slots' })}
+                                </button>
+                            )}
+                        </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
                         <label className="inline-flex items-center gap-2 cursor-pointer select-none">
                             <input
                                 type="checkbox"
@@ -706,62 +858,142 @@ export default function AsarBridgePanel() {
                                 disabled={actionLoading === 'dual-track'}
                                 onChange={(e) => handleToggleDualTrack(e.target.checked)}
                             />
-                            <span className="text-xs font-semibold text-gray-800 dark:text-gray-200 inline-flex items-center gap-1">
-                                <GitBranch size={13} className="text-emerald-500" />
+                            <span className="text-xs font-semibold text-gray-800 dark:text-gray-200">
                                 {t('proxy.asar.dual_track_label', {
-                                    defaultValue: 'Dual-Track (Tách làn Claude Lead & Gemini Worker)',
+                                    defaultValue: 'Tự động tách luồng đa tài khoản (Claude 5.5 / 4.6 & Gemini Full / Basic)',
                                 })}
                             </span>
                         </label>
 
-                        {dualTrackEnabled && (
-                            <div className="flex flex-wrap items-center gap-2 text-[11px]">
-                                <span className="px-2 py-0.5 rounded-md bg-amber-100/80 dark:bg-amber-950/50 text-amber-800 dark:text-amber-300 border border-amber-300/60 dark:border-amber-800/60 font-medium">
-                                    👑 Claude Slot:{' '}
-                                    <span className="font-mono font-bold">
-                                        {telemetry?.claude_slot_email || 'Auto'}
-                                    </span>
-                                </span>
-                                <span className="px-2 py-0.5 rounded-md bg-cyan-100/80 dark:bg-cyan-950/50 text-cyan-800 dark:text-cyan-300 border border-cyan-300/60 dark:border-cyan-800/60 font-medium">
-                                    ⚡ Gemini Slot:{' '}
-                                    <span className="font-mono font-bold">
-                                        {telemetry?.gemini_slot_email || 'Auto'}
-                                    </span>
-                                </span>
-                            </div>
-                        )}
+                        <label className="inline-flex items-center gap-2 cursor-pointer select-none">
+                            <input
+                                type="checkbox"
+                                className="toggle toggle-xs toggle-info"
+                                checked={telemetry?.separate_lite_slot ?? true}
+                                disabled={actionLoading === 'separate-lite'}
+                                onChange={(e) => handleToggleSeparateLiteSlot(e.target.checked)}
+                            />
+                            <span className="text-xs font-semibold text-gray-800 dark:text-gray-200">
+                                {t('proxy.asar.separate_lite_label', {
+                                    defaultValue: 'Tách riêng luồng cho model nền (3.5 Flash Lite)',
+                                })}
+                            </span>
+                        </label>
                     </div>
 
                     {dualTrackEnabled && (
-                        <button
-                            type="button"
-                            onClick={handleResetSlots}
-                            disabled={actionLoading === 'reset-slots'}
-                            className={BTN_SECONDARY}
-                        >
-                            <RotateCcw size={12} />
-                            {t('proxy.asar.reset_slots', { defaultValue: 'Reset Slots' })}
-                        </button>
+                        <div className="flex flex-col gap-1.5 rounded-lg bg-white/60 dark:bg-base-100/60 border border-emerald-200/50 dark:border-emerald-900/40 p-2.5 text-[11px]">
+                            {telemetry?.active_slots && telemetry.active_slots.length > 0 ? (
+                                telemetry.active_slots.map((slot) => {
+                                    const icon =
+                                        slot.family === 'Claude'
+                                            ? '👑'
+                                            : slot.tier_kind === 'Full'
+                                                ? '✨'
+                                                : slot.tier_kind === 'Lite'
+                                                    ? '⚡'
+                                                    : '🔹';
+                                    const badgeCls =
+                                        slot.family === 'Claude'
+                                            ? 'bg-amber-100/80 dark:bg-amber-950/50 text-amber-800 dark:text-amber-300 border-amber-300/60 dark:border-amber-800/60'
+                                            : slot.tier_kind === 'Full'
+                                                ? 'bg-emerald-100/80 dark:bg-emerald-950/50 text-emerald-800 dark:text-emerald-300 border-emerald-300/60 dark:border-emerald-800/60'
+                                                : slot.tier_kind === 'Lite'
+                                                    ? 'bg-indigo-100/80 dark:bg-indigo-950/50 text-indigo-800 dark:text-indigo-300 border-indigo-300/60 dark:border-indigo-800/60'
+                                                    : 'bg-cyan-100/80 dark:bg-cyan-950/50 text-cyan-800 dark:text-cyan-300 border-cyan-300/60 dark:border-cyan-800/60';
+                                    return (
+                                        <div
+                                            key={slot.slot_key}
+                                            className="flex flex-wrap items-center justify-between gap-2"
+                                        >
+                                            <div className="flex items-center gap-2 min-w-0">
+                                                <span className={cn('px-2 py-0.5 rounded-md border font-semibold shrink-0', badgeCls)}>
+                                                    {icon} {slot.family} {slot.tier_kind}
+                                                </span>
+                                                <span className="font-mono font-bold text-gray-800 dark:text-gray-200 truncate">
+                                                    {slot.email}
+                                                </span>
+                                                {slot.in_flight > 0 && (
+                                                    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 font-mono font-bold text-[10px]">
+                                                        ● {slot.in_flight}
+                                                    </span>
+                                                )}
+                                            </div>
+                                            {slot.models.length > 0 && (
+                                                <div className="flex flex-wrap items-center gap-1">
+                                                    {slot.models.map((m) => (
+                                                        <span
+                                                            key={m}
+                                                            className="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-base-200 text-gray-700 dark:text-gray-300 font-mono text-[10px] border border-gray-200/70 dark:border-gray-700/70"
+                                                        >
+                                                            {m}
+                                                        </span>
+                                                    ))}
+                                                </div>
+                                            )}
+                                        </div>
+                                    );
+                                })
+                            ) : telemetry?.claude_slot_email || telemetry?.gemini_slot_email ? (
+                                <div className="flex flex-wrap items-center gap-2">
+                                    <span className="px-2 py-0.5 rounded-md bg-amber-100/80 dark:bg-amber-950/50 text-amber-800 dark:text-amber-300 border border-amber-300/60 dark:border-amber-800/60 font-medium">
+                                        👑 Claude Slot:{' '}
+                                        <span className="font-mono font-bold">
+                                            {telemetry?.claude_slot_email || 'Auto'}
+                                        </span>
+                                    </span>
+                                    <span className="px-2 py-0.5 rounded-md bg-cyan-100/80 dark:bg-cyan-950/50 text-cyan-800 dark:text-cyan-300 border border-cyan-300/60 dark:border-cyan-800/60 font-medium">
+                                        ⚡ Gemini Slot:{' '}
+                                        <span className="font-mono font-bold">
+                                            {telemetry?.gemini_slot_email || 'Auto'}
+                                        </span>
+                                    </span>
+                                </div>
+                            ) : (
+                                <span className="text-gray-500 dark:text-gray-400 italic">
+                                    Chưa có luồng ghim (Auto khi gửi tin nhắn)
+                                </span>
+                            )}
+                        </div>
                     )}
                 </div>
 
                 {/* Equivalent Auto-Fallback Bar */}
                 <div className="pt-2.5 border-t border-emerald-200/60 dark:border-emerald-900/40 flex flex-wrap items-center justify-between gap-3">
-                    <div className="flex flex-col gap-0.5 min-w-0">
-                        <label className="inline-flex items-center gap-2 cursor-pointer select-none">
-                            <input
-                                type="checkbox"
-                                className="toggle toggle-xs toggle-success"
-                                checked={telemetry?.equivalent_fallback_enabled ?? true}
-                                disabled={actionLoading === 'equiv-fallback'}
-                                onChange={(e) => handleToggleEquivalentFallback(e.target.checked)}
-                            />
-                            <span className="text-xs font-semibold text-gray-800 dark:text-gray-200">
-                                {t('proxy.asar.fallback_label', {
-                                    defaultValue: 'Auto-Fallback (Cứu hộ khi hết nick Full)',
-                                })}
-                            </span>
-                        </label>
+                    <div className="flex flex-col gap-1.5 min-w-0">
+                        <div className="flex flex-wrap items-center gap-x-5 gap-y-1.5">
+                            <label className="inline-flex items-center gap-2 cursor-pointer select-none">
+                                <input
+                                    type="checkbox"
+                                    className="toggle toggle-xs toggle-success"
+                                    checked={telemetry?.equivalent_fallback_enabled ?? true}
+                                    disabled={actionLoading === 'equiv-fallback'}
+                                    onChange={(e) => handleToggleEquivalentFallback(e.target.checked)}
+                                />
+                                <span className="text-xs font-semibold text-gray-800 dark:text-gray-200">
+                                    {t('proxy.asar.fallback_label', {
+                                        defaultValue: 'Auto-Fallback (Cứu hộ khi hết nick Full)',
+                                    })}
+                                </span>
+                            </label>
+                            <label
+                                className="inline-flex items-center gap-2 cursor-pointer select-none"
+                                title="Cứu hộ chéo Claude ↔ Gemini khi cạn sạch 100% 1 họ model"
+                            >
+                                <input
+                                    type="checkbox"
+                                    className="toggle toggle-xs toggle-info"
+                                    checked={telemetry?.cross_family_fallback_enabled !== false}
+                                    disabled={actionLoading === 'cross-family-fallback'}
+                                    onChange={(e) => handleToggleCrossFamilyFallback(e.target.checked)}
+                                />
+                                <span className="text-xs font-semibold text-gray-800 dark:text-gray-200">
+                                    {t('proxy.asar.cross_family_label', {
+                                        defaultValue: '🔀 Cứu hộ chéo Claude ↔ Gemini khi cạn sạch 100% 1 họ model',
+                                    })}
+                                </span>
+                            </label>
+                        </div>
                         <p className="text-[11px] text-gray-500 dark:text-gray-400 pl-9">
                             {t('proxy.asar.fallback_desc', {
                                 defaultValue:
@@ -924,6 +1156,23 @@ export default function AsarBridgePanel() {
                                 className="pl-7 pr-2.5 py-1.5 text-xs border border-gray-200 dark:border-gray-700 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content w-44 outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
                             />
                         </div>
+                        <button
+                            type="button"
+                            onClick={handleRefreshIdeModels}
+                            disabled={actionLoading !== null}
+                            className={BTN_PRIMARY_EMERALD}
+                            title={t('proxy.asar.refresh_ide_models_tooltip', {
+                                defaultValue: 'Đồng bộ Full Model từ pool và đẩy ngay vào Antigravity IDE',
+                            })}
+                        >
+                            <RefreshCw
+                                size={12}
+                                className={actionLoading === 'refresh-ide-models' ? 'animate-spin' : ''}
+                            />
+                            {actionLoading === 'refresh-ide-models'
+                                ? t('proxy.asar.refreshing_ide_models', { defaultValue: 'Đang nạp...' })
+                                : t('proxy.asar.refresh_ide_models', { defaultValue: 'Cập nhật Model IDE' })}
+                        </button>
                         <button
                             type="button"
                             onClick={handleSyncPool}

@@ -100,6 +100,27 @@ export async function reloadCatalogModels(): Promise<boolean> {
     return await invoke<boolean>('reload_catalog_models');
 }
 
+export interface AsarActiveSlot {
+    slot_key: string;
+    family: string;
+    tier_kind: string;
+    account_id: string;
+    email: string;
+    models: string[];
+    in_flight: number;
+    last_used_ts: number;
+}
+
+export interface AsarInFlightStream {
+    stream_id: number;
+    slot_key: string;
+    account_id: string;
+    email: string;
+    requested_model: string;
+    target_model: string;
+    elapsed_ms: number;
+}
+
 export interface AsarTelemetrySnapshot {
     in_flight: number;
     asar_in_flight_account_ids: string[];
@@ -122,8 +143,12 @@ export interface AsarTelemetrySnapshot {
     proxy_in_flight_account_ids: string[];
     native_current_account_id: string | null;
     equivalent_fallback_enabled?: boolean;
+    cross_family_fallback_enabled?: boolean;
     fallback_downgrade_count?: number;
     last_fallback_route?: string | null;
+    active_slots?: AsarActiveSlot[];
+    separate_lite_slot?: boolean;
+    in_flight_streams?: AsarInFlightStream[];
 }
 
 export async function getCatalogPath(): Promise<string> {
@@ -148,4 +173,16 @@ export async function resetAsarSlots(): Promise<AsarTelemetrySnapshot> {
 
 export async function setAsarEquivalentFallback(enabled: boolean): Promise<AsarTelemetrySnapshot> {
     return await invoke<AsarTelemetrySnapshot>('set_asar_equivalent_fallback', { enabled });
+}
+
+export async function setAsarCrossFamilyFallback(enabled: boolean): Promise<AsarTelemetrySnapshot> {
+    return await invoke<AsarTelemetrySnapshot>('set_asar_cross_family_fallback', { enabled });
+}
+
+export async function setAsarSeparateLiteSlot(enabled: boolean): Promise<AsarTelemetrySnapshot> {
+    return await invoke<AsarTelemetrySnapshot>('set_asar_separate_lite_slot', { enabled });
+}
+
+export async function refreshIdeModels(): Promise<string> {
+    return await invoke<string>('refresh_ide_models');
 }

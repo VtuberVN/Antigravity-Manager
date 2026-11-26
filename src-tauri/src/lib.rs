@@ -740,6 +740,7 @@ pub fn run() {
                                 "ASAR Zero-Reload Bridge auto-started on 127.0.0.1:{}",
                                 asar_port
                             );
+                            crate::modules::asar_patch::hot_switch_if_unbridged(asar_port);
                         }
                     }
 
@@ -1109,7 +1110,10 @@ pub fn run() {
             commands::asar::get_asar_telemetry,
             commands::asar::set_asar_dual_track,
             commands::asar::set_asar_equivalent_fallback,
+            commands::asar::set_asar_cross_family_fallback,
+            commands::asar::set_asar_separate_lite_slot,
             commands::asar::reset_asar_slots,
+            commands::asar::refresh_ide_models,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

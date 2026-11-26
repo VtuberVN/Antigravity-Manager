@@ -120,6 +120,22 @@ export function isAccountAbnormal(account: Account): boolean {
 }
 
 /**
+ * 账号是否属于「被封禁 / 403 Forbidden」（严格排除 Need Verify 账号，避免与验证状态混淆）。
+ */
+export function isAccountBannedOr403(account: Account): boolean {
+    if (isAccountNeedsVerification(account)) return false;
+    const reason = (account.proxy_disabled_reason ?? '').toLowerCase();
+    return Boolean(
+        account.banned ||
+            account.quota?.is_forbidden ||
+            (account.proxy_disabled &&
+                (reason.startsWith('forbidden (403)') ||
+                    reason.includes('403 forbidden') ||
+                    reason.startsWith('banned:')))
+    );
+}
+
+/**
  * 账号是否处于健康可用状态（非异常、未停用）。
  */
 export function isAccountHealthy(account: Account): boolean {

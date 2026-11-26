@@ -30,7 +30,7 @@ import { AsarTelemetrySnapshot, getAsarTelemetry } from "../services/asarService
 import { useAccountStore } from "../stores/useAccountStore";
 import { useConfigStore } from "../stores/useConfigStore";
 import { Account, getAccountTier, ImportAccountEntry } from "../types/account";
-import { isAccountAbnormal, isAccountNeedsVerification, isFullCapabilityAccount } from "../utils/accountStatus";
+import { isAccountBannedOr403, isAccountNeedsVerification, isFullCapabilityAccount } from "../utils/accountStatus";
 import { getGroupQuotaSummaries } from "../utils/quotaDisplay";
 import { cn } from "../utils/cn";
 import { isTauri } from "../utils/env";
@@ -379,7 +379,7 @@ function Accounts() {
       ultra: searchedAccounts.filter((a) => getAccountTier(a) === "ultra").length,
       enterprise: searchedAccounts.filter((a) => getAccountTier(a) === "enterprise").length,
       free: searchedAccounts.filter((a) => getAccountTier(a) === "free").length,
-      abnormal: searchedAccounts.filter(isAccountAbnormal).length,
+      abnormal: searchedAccounts.filter(isAccountBannedOr403).length,
       need_verify: searchedAccounts.filter(isAccountNeedsVerification).length,
     };
   }, [searchedAccounts]);
@@ -387,7 +387,7 @@ function Accounts() {
   // 过滤和搜索基础结果 (Tab 1)
   const baseFilteredAccounts = useMemo(() => {
     if (filter === "all") return searchedAccounts;
-    if (filter === "abnormal") return searchedAccounts.filter(isAccountAbnormal);
+    if (filter === "abnormal") return searchedAccounts.filter(isAccountBannedOr403);
     if (filter === "need_verify") return searchedAccounts.filter(isAccountNeedsVerification);
     return searchedAccounts.filter((a) => getAccountTier(a) === filter);
   }, [searchedAccounts, filter]);
@@ -423,7 +423,7 @@ function Accounts() {
       if (hideFilters.hideNeedVerify && isAccountNeedsVerification(acc)) {
         return false;
       }
-      if (hideFilters.hideBanned403 && (acc.banned || acc.quota?.is_forbidden)) {
+      if (hideFilters.hideBanned403 && isAccountBannedOr403(acc)) {
         return false;
       }
       if (hideFilters.hideGeminiEmpty || hideFilters.hideClaudeEmpty) {
@@ -1069,27 +1069,29 @@ function Accounts() {
             </span>
           </button>
 
-          {/* ULTRA */}
-          <button
-            className={cn(
-              "flex px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 whitespace-nowrap shrink-0",
-              filter === 'ultra'
-                ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-black/5"
-                : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content hover:bg-white/40"
-            )}
-            onClick={() => setFilter('ultra')}
-            title={`${t('accounts.ultra')} (${filterCounts.ultra})`}
-          >
-            <span className="hidden md:inline">{t('accounts.ultra')}</span>
-            <span className={cn(
-              "px-1.5 py-0.5 rounded-md text-[10px] font-bold transition-colors",
-              filter === 'ultra'
-                ? "bg-blue-100 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400"
-                : "bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400"
-            )}>
-              {filterCounts.ultra}
-            </span>
-          </button>
+          {/* ULTRA (仅在数量 > 0 或已选中时显示，节省工具栏空间) */}
+          {(filterCounts.ultra > 0 || filter === 'ultra') && (
+            <button
+              className={cn(
+                "flex px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 whitespace-nowrap shrink-0",
+                filter === 'ultra'
+                  ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-black/5"
+                  : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content hover:bg-white/40"
+              )}
+              onClick={() => setFilter('ultra')}
+              title={`${t('accounts.ultra')} (${filterCounts.ultra})`}
+            >
+              <span className="hidden md:inline">{t('accounts.ultra')}</span>
+              <span className={cn(
+                "px-1.5 py-0.5 rounded-md text-[10px] font-bold transition-colors",
+                filter === 'ultra'
+                  ? "bg-blue-100 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400"
+                  : "bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400"
+              )}>
+                {filterCounts.ultra}
+              </span>
+            </button>
+          )}
 
           {/* ENTERPRISE (仅在数量 > 0 或已选中时显示，节省工具栏空间) */}
           {(filterCounts.enterprise > 0 || filter === 'enterprise') && (
@@ -1115,29 +1117,31 @@ function Accounts() {
             </button>
           )}
 
-          {/* FREE */}
-          <button
-            className={cn(
-              "flex px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 whitespace-nowrap shrink-0",
-              filter === 'free'
-                ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-black/5"
-                : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content hover:bg-white/40"
-            )}
-            onClick={() => setFilter('free')}
-            title={`${t('accounts.free')} (${filterCounts.free})`}
-          >
-            <span className="hidden md:inline">{t('accounts.free')}</span>
-            <span className={cn(
-              "px-1.5 py-0.5 rounded-md text-[10px] font-bold transition-colors",
-              filter === 'free'
-                ? "bg-blue-100 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400"
-                : "bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400"
-            )}>
-              {filterCounts.free}
-            </span>
-          </button>
+          {/* FREE (仅在数量 > 0 或已选中时显示，节省工具栏空间) */}
+          {(filterCounts.free > 0 || filter === 'free') && (
+            <button
+              className={cn(
+                "flex px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 whitespace-nowrap shrink-0",
+                filter === 'free'
+                  ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-black/5"
+                  : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content hover:bg-white/40"
+              )}
+              onClick={() => setFilter('free')}
+              title={`${t('accounts.free')} (${filterCounts.free})`}
+            >
+              <span className="hidden md:inline">{t('accounts.free')}</span>
+              <span className={cn(
+                "px-1.5 py-0.5 rounded-md text-[10px] font-bold transition-colors",
+                filter === 'free'
+                  ? "bg-blue-100 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400"
+                  : "bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400"
+              )}>
+                {filterCounts.free}
+              </span>
+            </button>
+          )}
 
-          {/* 异常 / 封禁 */}
+          {/* Bị Ban / 403 */}
           <button
             className={cn(
               "flex px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 whitespace-nowrap shrink-0",
@@ -1148,9 +1152,9 @@ function Accounts() {
                   : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content hover:bg-white/40"
             )}
             onClick={() => setFilter('abnormal')}
-            title={`${t('accounts.filter_abnormal', '异常/封禁')} (${filterCounts.abnormal})`}
+            title={`${t('accounts.filter_abnormal', 'Bị Ban / 403')} (${filterCounts.abnormal})`}
           >
-            <span className="hidden md:inline">{t('accounts.filter_abnormal', '异常')}</span>
+            <span className="hidden md:inline">{t('accounts.filter_abnormal', 'Bị Ban / 403')}</span>
             <span className={cn(
               "px-1.5 py-0.5 rounded-md text-[10px] font-bold transition-colors",
               filter === 'abnormal'
@@ -1261,7 +1265,7 @@ function Accounts() {
             <Sparkles
               className={`w-3.5 h-3.5 ${isWarmuping ? "animate-pulse" : ""}`}
             />
-            <span className="hidden xl:inline">
+            <span className="hidden 2xl:inline">
               {isWarmuping
                 ? t("common.loading")
                 : selectedIds.size > 0
@@ -1278,7 +1282,7 @@ function Accounts() {
             title={t("accounts.import_json")}
           >
             <Upload className="w-3.5 h-3.5" />
-            <span className="hidden lg:inline">
+            <span className="hidden 2xl:inline">
               {t("accounts.import_json")}
             </span>
           </button>
@@ -1293,7 +1297,7 @@ function Accounts() {
             }
           >
             <Download className="w-3.5 h-3.5" />
-            <span className="hidden lg:inline">
+            <span className="hidden 2xl:inline">
               {selectedIds.size > 0
                 ? t("accounts.export_selected", { count: selectedIds.size })
                 : t("common.export")}

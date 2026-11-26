@@ -21,7 +21,9 @@ import {
     getAsarBridgeStatus,
     getAsarStatus,
     getAsarTelemetry,
+    refreshIdeModels,
     resetAsarSlots,
+    setAsarCrossFamilyFallback,
     setAsarDualTrack,
     setAsarEquivalentFallback,
     startAsarBridge,
@@ -159,6 +161,7 @@ export default function MiniView() {
     const [bridgeStatus, setBridgeStatus] = useState<AsarBridgeStatus | null>(null);
     const [asarTelemetry, setAsarTelemetry] = useState<AsarTelemetrySnapshot | null>(null);
     const [asarBusy, setAsarBusy] = useState<string | null>(null);
+    const [ideModelsJustSynced, setIdeModelsJustSynced] = useState(false);
 
     const fetchAsarMiniState = useCallback(async () => {
         if (!isTauri()) return;
@@ -179,7 +182,7 @@ export default function MiniView() {
     useEffect(() => {
         if (!isTauri()) return;
         fetchAsarMiniState();
-        const timer = setInterval(fetchAsarMiniState, 2500);
+        const timer = setInterval(fetchAsarMiniState, 1500);
         return () => clearInterval(timer);
     }, [fetchAsarMiniState]);
 
@@ -356,6 +359,20 @@ export default function MiniView() {
         }
     };
 
+    const handleMiniToggleCrossFamilyFallback = async () => {
+        if (asarBusy) return;
+        setAsarBusy('cfb');
+        try {
+            const next = !(asarTelemetry?.cross_family_fallback_enabled !== false);
+            const snap = await setAsarCrossFamilyFallback(next);
+            setAsarTelemetry(snap);
+        } catch (e) {
+            console.error('Failed to toggle cross-family fallback:', e);
+        } finally {
+            setAsarBusy(null);
+        }
+    };
+
     const handleMiniResetSlots = async () => {
         if (asarBusy) return;
         setAsarBusy('slots');
@@ -364,6 +381,21 @@ export default function MiniView() {
             setAsarTelemetry(snap);
         } catch (e) {
             console.error('Failed to reset ASAR slots:', e);
+        } finally {
+            setAsarBusy(null);
+        }
+    };
+
+    const handleMiniRefreshIdeModels = async () => {
+        if (asarBusy) return;
+        setAsarBusy('ide-models');
+        try {
+            await refreshIdeModels();
+            await fetchAsarMiniState();
+            setIdeModelsJustSynced(true);
+            setTimeout(() => setIdeModelsJustSynced(false), 2500);
+        } catch (e) {
+            console.error('Failed to refresh IDE models:', e);
         } finally {
             setAsarBusy(null);
         }
@@ -776,6 +808,11 @@ export default function MiniView() {
                     className="flex items-center min-w-0 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden bg-black/[0.04] dark:bg-white/[0.07] p-0.5 rounded-xl gap-0.5"
                     data-tauri-drag-region="false"
                     onMouseDown={(e) => e.stopPropagation()}
+                    onWheel={(e) => {
+                        if (e.deltaY !== 0) {
+                            e.currentTarget.scrollLeft += e.deltaY;
+                        }
+                    }}
                 >
                     {tabs.map((tab) => {
                         const Icon = tab.icon;
@@ -791,12 +828,13 @@ export default function MiniView() {
                                 onMouseDown={(e) => e.stopPropagation()}
                                 onClick={(e) => {
                                     e.stopPropagation();
+                                    e.currentTarget.scrollIntoView({ behavior: 'smooth', inline: 'nearest', block: 'nearest' });
                                     setActiveTab(tab.key);
                                     setShowAccountList(false);
                                 }}
                                 title={tab.tooltip}
                                 className={clsx(
-                                    "relative flex items-center gap-1 px-1.5 py-0.5 rounded-lg text-[10.5px] whitespace-nowrap shrink-0 transition-all cursor-pointer outline-none focus:outline-none focus:ring-0 focus-visible:ring-0 select-none",
+                                    "relative flex items-center gap-0.5 px-1.5 py-0.5 rounded-lg text-[10px] whitespace-nowrap shrink-0 transition-all cursor-pointer outline-none focus:outline-none focus:ring-0 focus-visible:ring-0 select-none",
                                     isActive
                                         ? tab.key === 'asar'
                                             ? "bg-white dark:bg-zinc-800 text-emerald-600 dark:text-emerald-400 font-bold shadow-xs border border-emerald-500/25"
@@ -894,7 +932,7 @@ export default function MiniView() {
             </div>
 
             {/* 2. 核心内容区：尺寸固定，杜绝任何外部窗体拉伸 */}
-            <div className="flex-1 overflow-y-auto overflow-x-hidden p-3 space-y-2.5 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-gray-200 dark:scrollbar-thumb-white/10">
+            <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden p-3 space-y-2.5 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-black/15 dark:[&::-webkit-scrollbar-thumb]:bg-white/20">
                 {(activeTab === 'classic' || activeTab === 'ide') && bridgeStatus?.running && asarStatus?.heartbeat_active && (
                     <button
                         type="button"
@@ -1027,76 +1065,198 @@ export default function MiniView() {
 
                         {/* Live Active Account & Dual-Track Slots Card */}
                         <div className="bg-gradient-to-br from-emerald-500/[0.06] to-cyan-500/[0.04] dark:from-emerald-500/[0.1] dark:to-cyan-500/[0.05] rounded-xl p-2.5 border border-emerald-500/20 space-y-2">
-                            <div className="flex items-center justify-between gap-2">
-                                <div className="flex items-center gap-1.5 min-w-0 flex-1">
-                                    <span
-                                        className={clsx(
-                                            "w-2 h-2 rounded-full shrink-0",
-                                            (asarTelemetry?.in_flight ?? 0) > 0
-                                                ? "bg-emerald-500 animate-ping"
-                                                : bridgeStatus?.running
-                                                    ? "bg-emerald-500"
-                                                    : "bg-gray-400"
-                                        )}
-                                    />
-                                    <span className="text-[11px] font-bold text-gray-800 dark:text-zinc-100 truncate">
-                                        ⚡ Đang gánh IDE:{' '}
-                                        <span className="text-emerald-600 dark:text-emerald-400 font-mono">
-                                            {asarTelemetry?.last_active_email || 'Sẵn sàng'}
-                                        </span>
-                                    </span>
+                            {/* Section A: Live Concurrent Streams */}
+                            {(asarTelemetry?.in_flight_streams?.length ?? 0) > 0 ? (
+                                <div className="space-y-1">
+                                    <div className="flex items-center gap-1.5 text-[10.5px] font-bold text-emerald-700 dark:text-emerald-300">
+                                        <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping shrink-0" />
+                                        <span>🟢 Đang chạy trực tiếp ({asarTelemetry!.in_flight_streams!.length} luồng)</span>
+                                    </div>
+                                    <div className="flex flex-col gap-0.5 max-h-[84px] overflow-y-auto pr-0.5 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-black/15 dark:[&::-webkit-scrollbar-thumb]:bg-white/20">
+                                        {asarTelemetry!.in_flight_streams!.map((stream) => {
+                                            const modelText =
+                                                stream.requested_model && stream.requested_model !== stream.target_model
+                                                    ? `${stream.requested_model} → ${stream.target_model}`
+                                                    : stream.target_model;
+                                            return (
+                                                <div
+                                                    key={stream.stream_id}
+                                                    className="flex items-center justify-between gap-1.5 text-[10px] text-gray-800 dark:text-zinc-100"
+                                                >
+                                                    <div className="flex items-center gap-1 min-w-0 flex-1">
+                                                        <span className="text-emerald-500 shrink-0">●</span>
+                                                        <span className="font-mono font-semibold truncate min-w-0">
+                                                            {stream.email}
+                                                        </span>
+                                                        <span className="shrink-0 font-mono text-[9px] px-1 py-0.2 rounded bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 max-w-[130px] truncate">
+                                                            [{modelText}]
+                                                        </span>
+                                                    </div>
+                                                    <span className="shrink-0 font-mono text-[9.5px] text-gray-500 dark:text-gray-400">
+                                                        {Math.max(1, Math.round(stream.elapsed_ms / 1000))}s
+                                                    </span>
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
                                 </div>
-                                {asarTelemetry?.last_active_model && (
-                                    <span className="shrink-0 text-[9.5px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 max-w-[115px] truncate">
-                                        {asarTelemetry.last_active_model}
-                                    </span>
-                                )}
-                            </div>
+                            ) : (
+                                <div className="flex items-center justify-between gap-2">
+                                    <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                                        <span
+                                            className={clsx(
+                                                "w-2 h-2 rounded-full shrink-0",
+                                                bridgeStatus?.running ? "bg-emerald-500" : "bg-gray-400"
+                                            )}
+                                        />
+                                        <span className="text-[10.5px] font-bold text-gray-800 dark:text-zinc-100 truncate">
+                                            ⚡ Gần nhất:{' '}
+                                            <span className="text-emerald-600 dark:text-emerald-400 font-mono">
+                                                {asarTelemetry?.last_active_email || 'Auto'}
+                                            </span>
+                                        </span>
+                                    </div>
+                                    {asarTelemetry?.last_active_model && (
+                                        <span className="shrink-0 text-[9.5px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 max-w-[125px] truncate">
+                                            [{asarTelemetry.last_active_model}]
+                                        </span>
+                                    )}
+                                </div>
+                            )}
 
                             {(asarTelemetry?.dual_track_enabled ?? true) && (
-                                <div className="pt-1.5 border-t border-emerald-500/15 flex items-center justify-between gap-1.5 text-[10px]">
-                                    <div className="flex flex-col gap-0.5 min-w-0 flex-1">
-                                        <div className="truncate text-amber-700 dark:text-amber-300">
-                                            👑 Claude:{' '}
-                                            <span className="font-mono font-semibold">
-                                                {asarTelemetry?.claude_slot_email || 'Auto'}
-                                            </span>
-                                        </div>
-                                        <div className="truncate text-cyan-700 dark:text-cyan-300">
-                                            ⚡ Gemini:{' '}
-                                            <span className="font-mono font-semibold">
-                                                {asarTelemetry?.gemini_slot_email || 'Auto'}
-                                            </span>
-                                        </div>
+                                <div className="pt-1.5 border-t border-emerald-500/15 flex flex-col gap-1.5 text-[10px]">
+                                    <div className="flex flex-col gap-0.5 min-w-0 max-h-[140px] overflow-y-auto pr-0.5 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-black/15 dark:[&::-webkit-scrollbar-thumb]:bg-white/20">
+                                        {asarTelemetry?.active_slots && asarTelemetry.active_slots.length > 0 ? (
+                                            asarTelemetry.active_slots.map((slot) => {
+                                                const icon =
+                                                    slot.family === 'Claude'
+                                                        ? '👑'
+                                                        : slot.tier_kind === 'Full'
+                                                            ? '✨'
+                                                            : slot.tier_kind === 'Lite'
+                                                                ? '⚡'
+                                                                : '🔹';
+                                                const colorClass =
+                                                    slot.family === 'Claude'
+                                                        ? 'text-amber-700 dark:text-amber-300'
+                                                        : slot.tier_kind === 'Full'
+                                                            ? 'text-emerald-700 dark:text-emerald-300'
+                                                            : slot.tier_kind === 'Lite'
+                                                                ? 'text-indigo-700 dark:text-indigo-300'
+                                                                : 'text-cyan-700 dark:text-cyan-300';
+                                                return (
+                                                    <div
+                                                        key={slot.slot_key}
+                                                        className={clsx('flex items-center gap-1 min-w-0', colorClass)}
+                                                        title={`${slot.family} (${slot.tier_kind}): ${slot.email}${slot.models.length > 0 ? ` [${slot.models.join(' ; ')}]` : ''}`}
+                                                    >
+                                                        {slot.in_flight > 0 ? (
+                                                            <span className="shrink-0 inline-flex items-center gap-0.5 px-1 rounded bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 font-mono font-bold text-[9px]">
+                                                                ● {slot.in_flight}
+                                                            </span>
+                                                        ) : null}
+                                                        <span className="shrink-0">{icon} {slot.family}:</span>
+                                                        <span className="font-mono font-semibold truncate min-w-0">
+                                                            {slot.email}
+                                                        </span>
+                                                        {slot.models.length > 0 && (
+                                                            <span className="shrink-0 font-mono text-[9px] px-1 py-0.2 rounded bg-black/[0.05] dark:bg-white/[0.08] max-w-[115px] truncate">
+                                                                [{slot.models.join(' ; ')}]
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                );
+                                            })
+                                        ) : asarTelemetry?.claude_slot_email || asarTelemetry?.gemini_slot_email ? (
+                                            <>
+                                                <div className="truncate text-amber-700 dark:text-amber-300">
+                                                    👑 Claude:{' '}
+                                                    <span className="font-mono font-semibold">
+                                                        {asarTelemetry?.claude_slot_email || 'Auto'}
+                                                    </span>
+                                                </div>
+                                                <div className="truncate text-cyan-700 dark:text-cyan-300">
+                                                    ⚡ Gemini:{' '}
+                                                    <span className="font-mono font-semibold">
+                                                        {asarTelemetry?.gemini_slot_email || 'Auto'}
+                                                    </span>
+                                                </div>
+                                            </>
+                                        ) : (
+                                            <div className="text-[9.5px] text-gray-500 dark:text-gray-400 italic">
+                                                Chưa có luồng ghim (Auto khi gửi tin nhắn)
+                                            </div>
+                                        )}
                                     </div>
+                                    <div className="flex items-center justify-end gap-1 shrink-0">
+                                        <button
+                                            type="button"
+                                            disabled={asarBusy !== null}
+                                            onClick={handleMiniRefreshIdeModels}
+                                            className={clsx(
+                                                "shrink-0 flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition-colors cursor-pointer",
+                                                ideModelsJustSynced
+                                                    ? "bg-emerald-500/20 border-emerald-500/40 text-emerald-700 dark:text-emerald-300"
+                                                    : "bg-emerald-50/80 dark:bg-emerald-950/30 hover:bg-emerald-100/80 dark:hover:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 border-emerald-300/70 dark:border-emerald-700/50"
+                                            )}
+                                            title="Đồng bộ Full Model & làm mới danh sách model trong Antigravity IDE"
+                                        >
+                                            <RefreshCw size={10} className={asarBusy === 'ide-models' ? 'animate-spin' : ''} />
+                                            <span>
+                                                {asarBusy === 'ide-models'
+                                                    ? 'Đang nạp...'
+                                                    : ideModelsJustSynced
+                                                        ? '✓ Đã nạp IDE'
+                                                        : 'Nạp Model IDE'}
+                                            </span>
+                                        </button>
+                                        <button
+                                            type="button"
+                                            disabled={asarBusy !== null}
+                                            onClick={handleMiniResetSlots}
+                                            className="shrink-0 flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold bg-white/80 dark:bg-zinc-800/90 hover:bg-white dark:hover:bg-zinc-700 text-gray-700 dark:text-gray-200 border border-black/[0.08] dark:border-white/10 transition-colors cursor-pointer"
+                                            title="Reset các slot ghim Dual-Track"
+                                        >
+                                            <RotateCcw size={10} />
+                                            <span>Reset Slots</span>
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
+                            <div className="pt-1.5 border-t border-emerald-500/15 flex flex-wrap items-center justify-between gap-1.5 text-[10px]">
+                                <div className="flex items-center gap-1 shrink-0">
                                     <button
                                         type="button"
                                         disabled={asarBusy !== null}
-                                        onClick={handleMiniResetSlots}
-                                        className="shrink-0 flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold bg-white/80 dark:bg-zinc-800/90 hover:bg-white dark:hover:bg-zinc-700 text-gray-700 dark:text-gray-200 border border-black/[0.08] dark:border-white/10 transition-colors cursor-pointer"
-                                        title="Reset các slot ghim Dual-Track"
+                                        onClick={handleMiniToggleFallback}
+                                        className={clsx(
+                                            "flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition-colors cursor-pointer shrink-0",
+                                            (asarTelemetry?.equivalent_fallback_enabled ?? true)
+                                                ? "bg-emerald-50/80 dark:bg-emerald-950/30 border-emerald-300/70 dark:border-emerald-700/50 text-emerald-700 dark:text-emerald-300"
+                                                : "bg-black/[0.02] dark:bg-white/[0.04] border-black/[0.05] dark:border-white/[0.08] text-gray-500 dark:text-gray-400"
+                                        )}
+                                        title="Auto-Fallback: khi hết nick Full (Carbon/Neon/Claude 5.5) tự chạy đỡ qua Hydrogen / Claude 4.6"
                                     >
-                                        <RotateCcw size={10} />
-                                        <span>Reset Slots</span>
+                                        <span>🛟 Fallback</span>
+                                        <span>{(asarTelemetry?.equivalent_fallback_enabled ?? true) ? '● ON' : '○ OFF'}</span>
+                                    </button>
+                                    <button
+                                        type="button"
+                                        disabled={asarBusy !== null}
+                                        onClick={handleMiniToggleCrossFamilyFallback}
+                                        className={clsx(
+                                            "flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition-colors cursor-pointer shrink-0",
+                                            (asarTelemetry?.cross_family_fallback_enabled !== false)
+                                                ? "bg-cyan-50/80 dark:bg-cyan-950/30 border-cyan-300/70 dark:border-cyan-700/50 text-cyan-700 dark:text-cyan-300"
+                                                : "bg-black/[0.02] dark:bg-white/[0.04] border-black/[0.05] dark:border-white/[0.08] text-gray-500 dark:text-gray-400"
+                                        )}
+                                        title="Cứu hộ chéo Claude ↔ Gemini khi cạn sạch 100% 1 họ model"
+                                    >
+                                        <span>🔀 Cứu hộ chéo</span>
+                                        <span>{(asarTelemetry?.cross_family_fallback_enabled !== false) ? '● ON' : '○ OFF'}</span>
                                     </button>
                                 </div>
-                            )}
-                            <div className="pt-1.5 border-t border-emerald-500/15 flex items-center justify-between gap-1.5 text-[10px]">
-                                <button
-                                    type="button"
-                                    disabled={asarBusy !== null}
-                                    onClick={handleMiniToggleFallback}
-                                    className={clsx(
-                                        "flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition-colors cursor-pointer shrink-0",
-                                        (asarTelemetry?.equivalent_fallback_enabled ?? true)
-                                            ? "bg-emerald-50/80 dark:bg-emerald-950/30 border-emerald-300/70 dark:border-emerald-700/50 text-emerald-700 dark:text-emerald-300"
-                                            : "bg-black/[0.02] dark:bg-white/[0.04] border-black/[0.05] dark:border-white/[0.08] text-gray-500 dark:text-gray-400"
-                                    )}
-                                    title="Auto-Fallback: khi hết nick Full (Carbon/Neon/Claude 5.5) tự chạy đỡ qua Hydrogen / Claude 4.6"
-                                >
-                                    <span>🛟 Fallback</span>
-                                    <span>{(asarTelemetry?.equivalent_fallback_enabled ?? true) ? '● ON' : '○ OFF'}</span>
-                                </button>
                                 {(asarTelemetry?.fallback_downgrade_count ?? 0) > 0 && (
                                     <span
                                         className="min-w-0 truncate px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-700 dark:text-amber-300 font-mono"

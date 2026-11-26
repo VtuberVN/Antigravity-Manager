@@ -5461,6 +5461,59 @@ impl TokenManager {
         }
     }
 
+    /// Get an access token for a specific `account_id` for free metadata calls (e.g. `fetchAvailableModels`),
+    /// ignoring chat quota 0% and rate-limit cooldowns, skipping only active `validation_blocked`.
+    pub async fn get_metadata_token_by_id(
+        &self,
+        account_id: &str,
+    ) -> Result<(String, String, String), String> {
+        let now = chrono::Utc::now().timestamp();
+        let token_info = {
+            let Some(entry) = self.tokens.get(account_id) else {
+                return Err(format!("Account {} not found in pool", account_id));
+            };
+            let t = entry.value();
+            if t.validation_blocked
+                && (t.validation_blocked_until == 0 || t.validation_blocked_until > now)
+            {
+                return Err(format!("Account {} is validation_blocked", account_id));
+            }
+            (
+                t.access_token.clone(),
+                t.refresh_token.clone(),
+                t.timestamp,
+                t.expires_in,
+                t.email.clone(),
+            )
+        };
+
+        let (current_access_token, refresh_token, timestamp, expires_in, email) = token_info;
+        if !current_access_token.is_empty() && now < timestamp + expires_in - 300 {
+            return Ok((current_access_token, email, account_id.to_string()));
+        }
+
+        if refresh_token.is_empty() {
+            return Err(format!("Account {} has no refresh_token", account_id));
+        }
+
+        match crate::modules::oauth::refresh_access_token(&refresh_token, Some(account_id)).await {
+            Ok(token_response) => {
+                let new_now = chrono::Utc::now().timestamp();
+                if let Some(mut entry) = self.tokens.get_mut(account_id) {
+                    entry.access_token = token_response.access_token.clone();
+                    entry.expires_in = token_response.expires_in;
+                    entry.timestamp = new_now;
+                }
+                let _ = self.save_refreshed_token(account_id, &token_response).await;
+                Ok((token_response.access_token, email, account_id.to_string()))
+            }
+            Err(e) => Err(format!(
+                "Metadata token refresh failed for {}: {}",
+                email, e
+            )),
+        }
+    }
+
     // ===== 限流管理方法 =====
 
     /// 标记账号限流(从外部调用,通常在 handler 中)
