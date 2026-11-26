@@ -642,8 +642,8 @@ impl AsarModelCatalog {
         let _ = self.reload_if_changed();
         let official_map = official_models_map();
 
-        let raw_candidates: Vec<(String, Option<String>, Option<bool>, Option<bool>)> =
-            account_models.into_iter().collect();
+        type RawAccountCandidate = (String, Option<String>, Option<bool>, Option<bool>);
+        let raw_candidates: Vec<RawAccountCandidate> = account_models.into_iter().collect();
 
         // Collect all family roots that have explicit tier variants (-low/-medium/-high/-xhigh/-extra-low)
         // so bare roots (e.g. `gemini-4-carbon`, `gemini-4-argon`, `claude-sonnet-5-5`) are excluded.
@@ -992,7 +992,7 @@ fn is_legacy_seeded_entry(entry: &CatalogModelEntry) -> bool {
     false
 }
 
-fn sort_entries(entries: &mut Vec<CatalogModelEntry>) {
+fn sort_entries(entries: &mut [CatalogModelEntry]) {
     entries.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.id.cmp(&b.id)));
 }
 
@@ -1026,16 +1026,15 @@ fn normalize_and_ensure_defaults(entries: &mut Vec<CatalogModelEntry>) -> bool {
             entry.id = clean;
             modified = true;
         }
-        if entry.id.eq_ignore_ascii_case("claude-sonnet-4-6")
-            || entry.id.eq_ignore_ascii_case("claude-opus-4-6-thinking")
+        if (entry.id.eq_ignore_ascii_case("claude-sonnet-4-6")
+            || entry.id.eq_ignore_ascii_case("claude-opus-4-6-thinking"))
+            && (entry.context_window != 200_000 || entry.supports_audio || entry.supports_video)
         {
-            if entry.context_window != 200_000 || entry.supports_audio || entry.supports_video {
-                entry.context_window = 200_000;
-                entry.max_input_tokens = 200_000;
-                entry.supports_audio = false;
-                entry.supports_video = false;
-                modified = true;
-            }
+            entry.context_window = 200_000;
+            entry.max_input_tokens = 200_000;
+            entry.supports_audio = false;
+            entry.supports_video = false;
+            modified = true;
         }
     }
 
@@ -1208,7 +1207,7 @@ fn inject_with_catalog(
         },
     };
 
-    if !root_obj.get("models").map_or(false, |v| v.is_object()) {
+    if !root_obj.get("models").is_some_and(Value::is_object) {
         root_obj.insert("models".to_string(), Value::Object(Map::new()));
     }
 
@@ -1330,10 +1329,7 @@ fn inject_with_catalog(
     sync_tiered_model_ids(&mut root_obj, &normalized_models);
 
     root_obj.remove("deprecatedModelIds");
-    if !root_obj
-        .get("commandModelIds")
-        .map_or(false, |v| v.is_array())
-    {
+    if !root_obj.get("commandModelIds").is_some_and(Value::is_array) {
         let cmd_default = root_obj
             .get("defaultAgentModelId")
             .and_then(Value::as_str)
@@ -1341,7 +1337,7 @@ fn inject_with_catalog(
             .to_string();
         root_obj.insert("commandModelIds".to_string(), json!([cmd_default]));
     }
-    if !root_obj.get("tabModelIds").map_or(false, |v| v.is_array()) {
+    if !root_obj.get("tabModelIds").is_some_and(Value::is_array) {
         root_obj.insert(
             "tabModelIds".to_string(),
             json!(["gemini-3.5-flash-lite", "chat_20706"]),
@@ -1534,7 +1530,7 @@ fn sync_tiered_model_ids(root_obj: &mut Map<String, Value>, models_obj: &Map<Str
             let has_valid_flash_lite = tiered
                 .get("flashLite")
                 .and_then(|v| v.as_array())
-                .map_or(false, |a| !a.is_empty());
+                .is_some_and(|a| !a.is_empty());
             if !has_valid_flash_lite {
                 tiered.insert("flashLite".to_string(), json!([flash_lite_fallback]));
             }

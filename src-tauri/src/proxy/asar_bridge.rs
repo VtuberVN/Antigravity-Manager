@@ -723,7 +723,7 @@ async fn handle_v1internal_pool(
     };
 
     let pool_len = state.token_manager.len();
-    let max_account_attempts = pool_len.max(1).min(8);
+    let max_account_attempts = pool_len.clamp(1, 8);
     let mut tried_accounts = HashSet::new();
     let mut force_rotate = false;
     let mut last_error_status = StatusCode::SERVICE_UNAVAILABLE;
@@ -838,7 +838,7 @@ async fn handle_v1internal_pool(
                     let raw_stream = call_res
                         .response
                         .bytes_stream()
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+                        .map_err(std::io::Error::other);
 
                     let heal_ctx = ThinkingAutoHealContext {
                         upstream: state.upstream.clone(),
