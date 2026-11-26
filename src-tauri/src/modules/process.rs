@@ -837,14 +837,63 @@ fn language_server_subprocess_pids(system: &System, target_ide: Option<&str>) ->
 pub fn kill_language_server_subprocesses(target_ide: Option<&str>) -> Result<usize, String> {
     let mut system = System::new();
     system.refresh_processes(sysinfo::ProcessesToUpdate::All);
+    let current_pid = std::process::id();
 
-    let pids = language_server_subprocess_pids(&system, target_ide);
+    let mut pids = language_server_subprocess_pids(&system, target_ide);
+    let mut seen: std::collections::HashSet<u32> = pids.iter().copied().collect();
+
+    // Also sweep detached language_server / agy processes matching `target_ide`
+    for (pid, process) in system.processes() {
+        let pid_u32 = pid.as_u32();
+        if pid_u32 == current_pid || seen.contains(&pid_u32) {
+            continue;
+        }
+        let name = process.name().to_string_lossy().to_lowercase();
+        let exe_path = process
+            .exe()
+            .and_then(|p| p.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let args_str = process
+            .cmd()
+            .iter()
+            .map(|arg| arg.to_string_lossy().to_lowercase())
+            .collect::<Vec<String>>()
+            .join(" ");
+
+        if is_manager_or_tools_process(&name, &exe_path, &args_str) {
+            continue;
+        }
+
+        if is_language_server_process(&name, &exe_path)
+            && matches_target_client(target_ide, &name, &exe_path, "", &args_str)
+            && seen.insert(pid_u32)
+        {
+            pids.push(pid_u32);
+        }
+    }
+
     for pid_u32 in &pids {
         crate::modules::logger::log_info(&format!(
             "[HotSwitch] Terminating language_server subprocess (PID: {}, target: {:?})",
             pid_u32, target_ide
         ));
         force_kill_pid(*pid_u32);
+    }
+
+    // Poll up to 3000ms (15 x 200ms) until terminated language_server PIDs have exited
+    // so dying processes cannot overwrite Keyring / jetski-standalone-oauth-token after switch.
+    if !pids.is_empty() {
+        for _ in 0..15 {
+            thread::sleep(Duration::from_millis(200));
+            system.refresh_processes(sysinfo::ProcessesToUpdate::All);
+            let any_alive = pids
+                .iter()
+                .any(|pid_u32| system.process(sysinfo::Pid::from_u32(*pid_u32)).is_some());
+            if !any_alive {
+                break;
+            }
+        }
     }
 
     Ok(pids.len())

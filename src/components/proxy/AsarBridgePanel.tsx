@@ -44,6 +44,8 @@ import {
     setAsarDualTrack,
     setAsarEquivalentFallback,
     setAsarSeparateLiteSlot,
+    setAsarSkipIdeLogin,
+    setAsarTerminateProcesses,
     startAsarBridge,
     stopAsarBridge,
     syncCatalogFromAccounts,
@@ -100,7 +102,7 @@ export default function AsarBridgePanel() {
     const [bridgeStatus, setBridgeStatus] = useState<AsarBridgeStatus | null>(null);
     const [telemetry, setTelemetry] = useState<AsarTelemetrySnapshot | null>(null);
     const [portInput, setPortInput] = useState<number>(DEFAULT_PORT);
-    const [terminateProcesses, setTerminateProcesses] = useState<boolean>(false);
+    const [terminateProcesses, setTerminateProcesses] = useState<boolean>(true);
 
     const [catalogModels, setCatalogModels] = useState<CatalogModelEntry[]>([]);
     const [catalogPath, setCatalogPath] = useState<string>('');
@@ -126,6 +128,9 @@ export default function AsarBridgePanel() {
             setAsarStatus(asar);
             setBridgeStatus(bridge);
             if (snap) setTelemetry(snap);
+            if (typeof asar.terminate_processes === 'boolean') {
+                setTerminateProcesses(asar.terminate_processes);
+            }
             setPortInput(asar.bridge_port || bridge.port || DEFAULT_PORT);
             setCatalogModels(models);
             setCatalogPath(path);
@@ -243,6 +248,24 @@ export default function AsarBridgePanel() {
         }
     };
 
+    const handleToggleSkipIdeLogin = async (enabled: boolean) => {
+        setActionLoading('skip-ide-login');
+        try {
+            const snap = await setAsarSkipIdeLogin(enabled);
+            setTelemetry(snap);
+            showToast(
+                enabled
+                    ? 'Đã bật chế độ bỏ qua đăng nhập IDE (ASAR)'
+                    : 'Đã tắt chế độ bỏ qua đăng nhập IDE (ASAR)',
+                'success',
+            );
+        } catch (error) {
+            showToast(String(error), 'error');
+        } finally {
+            setActionLoading(null);
+        }
+    };
+
     const handleResetSlots = async () => {
         setActionLoading('reset-slots');
         try {
@@ -286,6 +309,23 @@ export default function AsarBridgePanel() {
             showToast(String(error), 'error');
         } finally {
             setActionLoading(null);
+        }
+    };
+
+    const handleToggleTerminateProcesses = async (checked: boolean) => {
+        setTerminateProcesses(checked);
+        try {
+            const saved = await setAsarTerminateProcesses(checked);
+            setTerminateProcesses(saved);
+            showToast(
+                checked
+                    ? 'Đã bật tự động đóng Antigravity IDE trước khi Vá / Gỡ vá (đã lưu)'
+                    : 'Đã tắt tự động đóng Antigravity IDE trước khi Vá / Gỡ vá (đã lưu)',
+                'success',
+            );
+        } catch (error) {
+            console.error('Failed to save terminate_processes preference:', error);
+            showToast(String(error), 'error');
         }
     };
 
@@ -879,6 +919,31 @@ export default function AsarBridgePanel() {
                                 })}
                             </span>
                         </label>
+
+                        <label
+                            className="inline-flex items-center gap-2 cursor-pointer select-none"
+                            title="Tự động nạp tài khoản khỏe & giả lập phiên hợp lệ qua :8989 để Antigravity không văng ra trang đăng nhập Google khi đang bật ASAR."
+                        >
+                            <input
+                                type="checkbox"
+                                className="toggle toggle-xs toggle-success"
+                                checked={telemetry?.skip_ide_login_when_asar !== false}
+                                disabled={actionLoading === 'skip-ide-login'}
+                                onChange={(e) => handleToggleSkipIdeLogin(e.target.checked)}
+                            />
+                            <span className="text-xs font-semibold text-gray-800 dark:text-gray-200">
+                                🔓 Bỏ qua đăng nhập IDE (ASAR) •{' '}
+                                <span
+                                    className={
+                                        telemetry?.skip_ide_login_when_asar !== false
+                                            ? 'text-emerald-600 dark:text-emerald-400'
+                                            : 'text-gray-400 dark:text-gray-500'
+                                    }
+                                >
+                                    {telemetry?.skip_ide_login_when_asar !== false ? 'ON' : 'OFF'}
+                                </span>
+                            </span>
+                        </label>
                     </div>
 
                     {dualTrackEnabled && (
@@ -1074,27 +1139,90 @@ export default function AsarBridgePanel() {
                     </div>
                 </div>
 
-                <label className="flex items-center gap-2.5 text-xs text-gray-600 dark:text-gray-300 cursor-pointer select-none">
-                    <input
-                        type="checkbox"
-                        className="w-4 h-4 rounded border-gray-300 dark:border-gray-600 accent-emerald-500 cursor-pointer"
-                        checked={terminateProcesses}
-                        onChange={(e) => setTerminateProcesses(e.target.checked)}
-                    />
-                    {t('proxy.asar.terminate_processes', {
-                        defaultValue: 'Terminate running Antigravity processes before Patch / Restore (recommended if file is locked)',
-                    })}
-                </label>
+                <div className="space-y-1">
+                    <label className="flex items-center gap-2.5 text-xs font-semibold text-gray-800 dark:text-gray-200 cursor-pointer select-none">
+                        <input
+                            type="checkbox"
+                            className="w-4 h-4 rounded border-gray-300 dark:border-gray-600 accent-emerald-500 cursor-pointer shrink-0"
+                            checked={terminateProcesses}
+                            onChange={(e) => handleToggleTerminateProcesses(e.target.checked)}
+                        />
+                        <span>Tự động đóng Antigravity IDE trước khi Vá / Gỡ vá (Khuyên bật)</span>
+                    </label>
+                    <p className="text-[11px] text-gray-500 dark:text-gray-400 pl-6 leading-relaxed">
+                        Khi Antigravity đang chạy, Windows sẽ khóa file app.asar khiến việc ghi đè/gỡ vá bị chặn. Bật tùy chọn này (tự động lưu) để đóng tiến trình Antigravity trước khi ghi thật xuống ổ cứng.
+                    </p>
+                </div>
 
                 {/* Detected app.asar paths */}
                 <div className="pt-2.5 border-t border-gray-100 dark:border-base-200 space-y-1.5">
                     <div className="text-[11px] font-semibold text-gray-600 dark:text-gray-400 flex items-center gap-1.5">
                         <HardDrive size={12} />
                         {t('proxy.asar.detected_paths', {
-                            defaultValue: `Detected app.asar Paths (${asarStatus?.asar_paths.length ?? 0})`,
+                            defaultValue: `Detected app.asar Paths (${asarStatus?.file_details?.length ?? asarStatus?.asar_paths.length ?? 0})`,
                         })}
                     </div>
-                    {asarStatus && asarStatus.asar_paths.length > 0 ? (
+                    {asarStatus && (asarStatus.file_details?.length ?? 0) > 0 ? (
+                        <div className="space-y-1.5 max-h-52 overflow-y-auto">
+                            {asarStatus.file_details!.map((d) => {
+                                const sizeMb = `${(d.size_bytes / (1024 * 1024)).toFixed(1)} MB`;
+                                const methodLabel =
+                                    d.patch_method === 'smart_heartbeat' ? 'Smart Heartbeat' : 'Static URL';
+                                const offsetLabel =
+                                    d.patch_offset != null ? ` @ 0x${d.patch_offset.toString(16)}` : '';
+                                const matchesOriginal =
+                                    !d.is_patched &&
+                                    Boolean(d.original_sha256_short) &&
+                                    d.original_sha256_short === d.sha256_short;
+                                return (
+                                    <div
+                                        key={d.path}
+                                        className="px-3 py-2 rounded-lg bg-gray-50 dark:bg-base-200 border border-gray-200/70 dark:border-base-300 space-y-1"
+                                    >
+                                        <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                                            <div className="flex items-center gap-2 min-w-0 font-mono text-gray-800 dark:text-gray-200">
+                                                <span className="truncate" title={d.path}>
+                                                    {d.path}
+                                                </span>
+                                                <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded bg-gray-200/80 dark:bg-base-300 text-gray-600 dark:text-gray-400">
+                                                    {sizeMb}
+                                                </span>
+                                            </div>
+                                            {d.is_patched ? (
+                                                <span className="shrink-0 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/60 dark:text-emerald-300 dark:border-emerald-800/60">
+                                                    {`✓ Đã vá trên đĩa (${methodLabel}${offsetLabel})`}
+                                                </span>
+                                            ) : (
+                                                <span className="shrink-0 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200 dark:bg-slate-800/60 dark:text-slate-300 dark:border-slate-700">
+                                                    ○ Nguyên bản gốc (Chưa vá)
+                                                </span>
+                                            )}
+                                        </div>
+                                        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10.5px] font-mono text-gray-500 dark:text-gray-400">
+                                            <span>
+                                                SHA-256 hiện tại:{' '}
+                                                <span className="font-semibold text-gray-700 dark:text-gray-200">
+                                                    {d.sha256_short}
+                                                </span>
+                                            </span>
+                                            <span className="text-gray-300 dark:text-gray-600">|</span>
+                                            <span>
+                                                Bản gốc (.original):{' '}
+                                                <span className="font-semibold text-gray-700 dark:text-gray-200">
+                                                    {d.original_sha256_short || 'Chưa tạo'}
+                                                </span>
+                                            </span>
+                                            {matchesOriginal && (
+                                                <span className="inline-flex items-center px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200/80 dark:bg-blue-950/50 dark:text-blue-300 dark:border-blue-800/60 font-sans font-semibold text-[10px]">
+                                                    ✓ Khớp 100% bản gốc
+                                                </span>
+                                            )}
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    ) : asarStatus && asarStatus.asar_paths.length > 0 ? (
                         <div className="space-y-1 max-h-28 overflow-y-auto">
                             {asarStatus.asar_paths.map((p) => {
                                 const hasBackup = asarStatus.backup_paths.some((b) =>

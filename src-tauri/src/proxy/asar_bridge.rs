@@ -113,6 +113,7 @@ pub struct AsarTelemetrySnapshot {
     pub cross_family_fallback_enabled: bool,
     pub fallback_downgrade_count: u64,
     pub last_fallback_route: Option<String>,
+    pub skip_ide_login_when_asar: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +257,7 @@ struct AsarTelemetryHub {
     equivalent_fallback_enabled: AtomicBool,
     cross_family_fallback_enabled: AtomicBool,
     separate_lite_slot: AtomicBool,
+    skip_ide_login_when_asar: AtomicBool,
     fallback_downgrade_count: AtomicU64,
     last_fallback_route: RwLock<Option<String>>,
     /// 5 named sticky slots: claude_full, claude_basic, gemini_full, gemini_basic, gemini_lite
@@ -276,13 +278,15 @@ impl AsarTelemetryHub {
             persisted_fallback,
             persisted_separate_lite,
             persisted_cross_family,
+            persisted_skip_login,
         ) = if cfg!(test) {
-            (true, true, true, true)
+            (true, true, true, true, true)
         } else {
             let (dt, ef) = crate::modules::asar_patch::get_bridge_flags();
             let sl = crate::modules::asar_patch::get_separate_lite_slot_flag();
             let cf = crate::modules::asar_patch::get_cross_family_fallback_flag();
-            (dt, ef, sl, cf)
+            let sk = crate::modules::asar_patch::get_skip_ide_login_flag();
+            (dt, ef, sl, cf, sk)
         };
         Self {
             in_flight: AtomicU64::new(0),
@@ -297,6 +301,7 @@ impl AsarTelemetryHub {
             equivalent_fallback_enabled: AtomicBool::new(persisted_fallback),
             cross_family_fallback_enabled: AtomicBool::new(persisted_cross_family),
             separate_lite_slot: AtomicBool::new(persisted_separate_lite),
+            skip_ide_login_when_asar: AtomicBool::new(persisted_skip_login),
             fallback_downgrade_count: AtomicU64::new(0),
             last_fallback_route: RwLock::new(None),
             slots: RwLock::new(HashMap::new()),
@@ -339,6 +344,15 @@ impl AsarTelemetryHub {
 
     fn is_separate_lite_slot_enabled(&self) -> bool {
         self.separate_lite_slot.load(Ordering::Relaxed)
+    }
+
+    fn is_skip_ide_login_enabled(&self) -> bool {
+        self.skip_ide_login_when_asar.load(Ordering::Relaxed)
+    }
+
+    fn set_skip_ide_login(&self, enabled: bool) {
+        self.skip_ide_login_when_asar
+            .store(enabled, Ordering::Relaxed);
     }
 
     fn set_separate_lite_slot(&self, enabled: bool) {
@@ -678,6 +692,16 @@ pub fn set_separate_lite_slot_enabled(enabled: bool) {
     if let Err(e) = crate::modules::asar_patch::persist_separate_lite_slot_flag(enabled) {
         tracing::warn!(
             "[ASAR-Bridge] Failed to persist separate_lite_slot flag: {}",
+            e
+        );
+    }
+}
+
+pub fn set_skip_ide_login_enabled(enabled: bool) {
+    ASAR_TELEMETRY.set_skip_ide_login(enabled);
+    if let Err(e) = crate::modules::asar_patch::persist_skip_ide_login_flag(enabled) {
+        tracing::warn!(
+            "[ASAR-Bridge] Failed to persist skip_ide_login_when_asar flag: {}",
             e
         );
     }
@@ -1029,6 +1053,7 @@ pub async fn snapshot_asar_telemetry(state: Option<&AppState>) -> AsarTelemetryS
             .read()
             .ok()
             .and_then(|g| g.clone()),
+        skip_ide_login_when_asar: ASAR_TELEMETRY.is_skip_ide_login_enabled(),
     }
 }
 
@@ -2493,8 +2518,27 @@ pub(crate) fn extract_usage_from_json_value(val: &Value) -> Option<CanonicalUsag
     Some(CanonicalUsage::from_gemini(usage))
 }
 
+pub(crate) fn is_setup_auth_rpc(rpc_method: &str) -> bool {
+    matches!(
+        rpc_method,
+        "loadCodeAssist" | "onboardUser" | "fetchUserInfo" | "retrieveUserQuota"
+    )
+}
+
+pub(crate) fn is_unonboarded_load_code_assist(rpc_method: &str, body_bytes: &[u8]) -> bool {
+    if rpc_method != "loadCodeAssist" || body_bytes.is_empty() {
+        return false;
+    }
+    let Ok(val) = serde_json::from_slice::<Value>(body_bytes) else {
+        return false;
+    };
+    val.get("ineligibleTiers").is_some() && val.get("currentTier").is_none_or(Value::is_null)
+}
+
 /// Clean byte-identical pass-through for setup/account `/v1internal:*` RPC endpoints
 /// (e.g. `loadCodeAssist`, `onboardUser`, `fetchUserInfo`, `retrieveUserQuota`).
+/// When `skip_ide_login_when_asar` is enabled, transparently rescues setup/auth RPCs
+/// that have no token, fail with 401/403, or return an un-onboarded `ineligibleTiers` response.
 async fn handle_v1internal_passthrough(
     state: AppState,
     rpc_method: &str,
@@ -2513,65 +2557,187 @@ async fn handle_v1internal_passthrough(
     };
 
     let extra_headers = collect_extra_headers(&headers);
-    // Setup/auth/account RPCs (loadCodeAssist, onboardUser, fetchUserInfo, etc.)
-    // must bypass model-quota filtering: prefer the client's own Bearer token first,
-    // and only fall back to any healthy pool account without model-quota restriction.
-    let token_and_acc = if let Some(client_tok) = extract_bearer_token(&headers) {
-        Some((client_tok, None))
-    } else if let Ok((tok, _proj, _email, acc_id, _)) = state
+    let skip_login_rescue =
+        ASAR_TELEMETRY.is_skip_ide_login_enabled() && is_setup_auth_rpc(rpc_method);
+
+    // Prefer client's own Bearer token first if present; otherwise pick a healthy pool account.
+    let mut last_resp: Option<(StatusCode, String, Bytes)> = None;
+    let mut last_err: Option<String> = None;
+
+    if let Some(client_tok) = extract_bearer_token(&headers) {
+        match state
+            .upstream
+            .call_v1_internal_raw_bytes(
+                rpc_method,
+                &client_tok,
+                raw_body.clone(),
+                incoming_ct.as_deref(),
+                query.as_deref(),
+                extra_headers.clone(),
+                None,
+            )
+            .await
+        {
+            Ok(call_res) => {
+                let status = call_res.response.status();
+                let ct = call_res
+                    .response
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("application/json")
+                    .to_string();
+                let bytes = call_res.response.bytes().await.unwrap_or_default();
+
+                let needs_rescue = skip_login_rescue
+                    && (status == StatusCode::UNAUTHORIZED
+                        || status == StatusCode::FORBIDDEN
+                        || (status.is_success()
+                            && is_unonboarded_load_code_assist(rpc_method, &bytes)));
+                if !needs_rescue {
+                    return Response::builder()
+                        .status(status)
+                        .header(axum::http::header::CONTENT_TYPE, ct)
+                        .body(Body::from(bytes))
+                        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+                }
+                tracing::warn!(
+                    "[ASAR-Bridge] Setup RPC {} needs login rescue (status={}); retrying with healthy pool account",
+                    rpc_method,
+                    status.as_u16()
+                );
+                last_resp = Some((status, ct, bytes));
+            }
+            Err(e) => {
+                if !skip_login_rescue {
+                    return json_error(StatusCode::BAD_GATEWAY, &e);
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+
+    // Pool account rescue / tokenless passthrough
+    let ordered_ids = ordered_pool_account_ids_by_tier(&state);
+    let mut tried = HashSet::new();
+
+    for acc_id in ordered_ids.iter().take(4) {
+        if !tried.insert(acc_id.clone()) {
+            continue;
+        }
+        let Ok((tok, email, resolved_id)) =
+            state.token_manager.get_metadata_token_by_id(acc_id).await
+        else {
+            continue;
+        };
+        match state
+            .upstream
+            .call_v1_internal_raw_bytes(
+                rpc_method,
+                &tok,
+                raw_body.clone(),
+                incoming_ct.as_deref(),
+                query.as_deref(),
+                extra_headers.clone(),
+                Some(&resolved_id),
+            )
+            .await
+        {
+            Ok(call_res) => {
+                let status = call_res.response.status();
+                let ct = call_res
+                    .response
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("application/json")
+                    .to_string();
+                let bytes = call_res.response.bytes().await.unwrap_or_default();
+
+                let still_bad = skip_login_rescue
+                    && (status == StatusCode::UNAUTHORIZED
+                        || status == StatusCode::FORBIDDEN
+                        || (status.is_success()
+                            && is_unonboarded_load_code_assist(rpc_method, &bytes)));
+                if !still_bad || !skip_login_rescue {
+                    if status.is_success() && last_resp.is_some() {
+                        tracing::info!(
+                            "[ASAR-Bridge] Rescued setup RPC {} using pool account {}",
+                            rpc_method,
+                            email
+                        );
+                    }
+                    return Response::builder()
+                        .status(status)
+                        .header(axum::http::header::CONTENT_TYPE, ct)
+                        .body(Body::from(bytes))
+                        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+                }
+                last_resp = Some((status, ct, bytes));
+            }
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+    }
+
+    // Fallback to generic get_token if ordered metadata tokens didn't succeed
+    if let Ok((tok, _proj, _email, acc_id, _)) = state
         .token_manager
         .get_token("gemini", false, None, "")
         .await
+        .or(state
+            .token_manager
+            .get_token("gemini", false, None, "gemini-3.8-flash")
+            .await)
     {
-        Some((tok, Some(acc_id)))
-    } else if let Ok((tok, _proj, _email, acc_id, _)) = state
-        .token_manager
-        .get_token("gemini", false, None, "gemini-3.8-flash")
-        .await
-    {
-        Some((tok, Some(acc_id)))
-    } else {
-        None
-    };
-
-    let Some((token, acc_id)) = token_and_acc else {
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "No valid Google token available for v1internal pass-through",
-        );
-    };
-
-    match state
-        .upstream
-        .call_v1_internal_raw_bytes(
-            rpc_method,
-            &token,
-            raw_body,
-            incoming_ct.as_deref(),
-            query.as_deref(),
-            extra_headers,
-            acc_id.as_deref(),
-        )
-        .await
-    {
-        Ok(call_res) => {
-            let status = call_res.response.status();
-            let ct = call_res
-                .response
-                .headers()
-                .get(axum::http::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("application/json")
-                .to_string();
-            let bytes = call_res.response.bytes().await.unwrap_or_default();
-            Response::builder()
-                .status(status)
-                .header(axum::http::header::CONTENT_TYPE, ct)
-                .body(Body::from(bytes))
-                .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+        if !tried.contains(&acc_id) {
+            if let Ok(call_res) = state
+                .upstream
+                .call_v1_internal_raw_bytes(
+                    rpc_method,
+                    &tok,
+                    raw_body,
+                    incoming_ct.as_deref(),
+                    query.as_deref(),
+                    extra_headers,
+                    Some(&acc_id),
+                )
+                .await
+            {
+                let status = call_res.response.status();
+                let ct = call_res
+                    .response
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("application/json")
+                    .to_string();
+                let bytes = call_res.response.bytes().await.unwrap_or_default();
+                return Response::builder()
+                    .status(status)
+                    .header(axum::http::header::CONTENT_TYPE, ct)
+                    .body(Body::from(bytes))
+                    .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+            }
         }
-        Err(e) => json_error(StatusCode::BAD_GATEWAY, &e),
     }
+
+    if let Some((status, ct, bytes)) = last_resp {
+        return Response::builder()
+            .status(status)
+            .header(axum::http::header::CONTENT_TYPE, ct)
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+    }
+    if let Some(err) = last_err {
+        return json_error(StatusCode::BAD_GATEWAY, &err);
+    }
+
+    json_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "No valid Google token available for v1internal pass-through",
+    )
 }
 
 pub(crate) fn is_pool_ai_rpc(rpc_method: &str) -> bool {
@@ -3707,5 +3873,27 @@ mod tests {
         }
         let after = ASAR_TELEMETRY.active_streams_snapshot();
         assert!(!after.iter().any(|s| s.account_id == "acc-stream-test"));
+    }
+
+    #[test]
+    fn test_setup_auth_rpc_and_unonboarded_load_code_assist_detection() {
+        assert!(is_setup_auth_rpc("loadCodeAssist"));
+        assert!(is_setup_auth_rpc("onboardUser"));
+        assert!(is_setup_auth_rpc("fetchUserInfo"));
+        assert!(is_setup_auth_rpc("retrieveUserQuota"));
+        assert!(!is_setup_auth_rpc("streamGenerateContent"));
+
+        let unonboarded = br#"{"ineligibleTiers":[{"reasonCode":"VERIFY"}]}"#;
+        assert!(is_unonboarded_load_code_assist(
+            "loadCodeAssist",
+            unonboarded
+        ));
+        assert!(!is_unonboarded_load_code_assist("onboardUser", unonboarded));
+
+        let onboarded = br#"{"currentTier":{"id":"pro"},"ineligibleTiers":[]}"#;
+        assert!(!is_unonboarded_load_code_assist(
+            "loadCodeAssist",
+            onboarded
+        ));
     }
 }

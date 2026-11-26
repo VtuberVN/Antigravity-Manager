@@ -154,6 +154,14 @@ fn apply_account_credentials(
             ));
         }
 
+        // 1.5 同步 Electron app_storage.json 的 agy.onboarding.lastLoginUsername / lastLoginIsGcpTos
+        if let Err(app_storage_err) = sync_electron_app_storage(account, effective_target) {
+            crate::modules::logger::log_warn(&format!(
+                "[Desktop] Warning: Failed to sync app_storage.json for IDE: {}",
+                app_storage_err
+            ));
+        }
+
         return Ok(());
     }
 
@@ -284,6 +292,14 @@ fn apply_account_credentials(
         crate::modules::logger::log_warn(&format!(
             "[Desktop] Warning: Failed to write file credentials for classic: {}",
             file_err
+        ));
+    }
+
+    // 2.4.1 同步 Electron app_storage.json 的 agy.onboarding.lastLoginUsername / lastLoginIsGcpTos
+    if let Err(app_storage_err) = sync_electron_app_storage(account, effective_target) {
+        crate::modules::logger::log_warn(&format!(
+            "[Desktop] Warning: Failed to sync app_storage.json for classic: {}",
+            app_storage_err
         ));
     }
 
@@ -646,78 +662,32 @@ pub(crate) fn write_to_system_keyring(account: &crate::models::Account) -> Resul
 
     #[cfg(target_os = "windows")]
     {
-        // 2.2 Windows Credential Manager direct Win32 API calls to write raw UTF-8 bytes
-        use std::os::windows::ffi::OsStrExt;
-        use std::ptr;
-
-        #[repr(C)]
-        struct FILETIME {
-            dw_low_date_time: u32,
-            dw_high_date_time: u32,
+        if let Err(err) = win_cred::write_generic_credential(
+            "gemini:antigravity",
+            "antigravity",
+            payload_json.as_bytes(),
+        ) {
+            return Err(err);
         }
-
-        #[repr(C)]
-        struct CREDENTIALW {
-            flags: u32,
-            cred_type: u32,
-            target_name: *const u16,
-            comment: *const u16,
-            last_written: FILETIME,
-            credential_blob_size: u32,
-            credential_blob: *const u8,
-            persist: u32,
-            attribute_count: u32,
-            attributes: *const std::ffi::c_void,
-            target_alias: *const u16,
-            user_name: *const u16,
-        }
-
-        #[link(name = "advapi32")]
-        extern "system" {
-            fn CredWriteW(credential: *const CREDENTIALW, flags: u32) -> i32;
-            fn CredDeleteW(target_name: *const u16, type_: u32, flags: u32) -> i32;
-        }
-
-        let target = "gemini:antigravity";
-        let user = "antigravity";
-        let secret = payload_json.as_bytes();
-
-        let target_wide: Vec<u16> = std::ffi::OsStr::new(target)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-
-        let user_wide: Vec<u16> = std::ffi::OsStr::new(user)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-
-        let cred = CREDENTIALW {
-            flags: 0,
-            cred_type: 1, // CRED_TYPE_GENERIC
-            target_name: target_wide.as_ptr(),
-            comment: ptr::null(),
-            last_written: FILETIME {
-                dw_low_date_time: 0,
-                dw_high_date_time: 0,
-            },
-            credential_blob_size: secret.len() as u32,
-            credential_blob: secret.as_ptr(),
-            persist: 2, // CRED_PERSIST_LOCAL_MACHINE
-            attribute_count: 0,
-            attributes: ptr::null(),
-            target_alias: ptr::null(),
-            user_name: user_wide.as_ptr(),
-        };
-
-        unsafe {
-            // Delete first to ensure we write clean
-            let _ = CredDeleteW(target_wide.as_ptr(), 1, 0);
-
-            let res = CredWriteW(&cred, 0);
-            if res == 0 {
-                let err = std::io::Error::last_os_error();
-                return Err(format!("Windows CredWriteW failed: {}", err));
+        let verified = win_cred::read_generic_credential("gemini:antigravity")
+            .is_some_and(|payload| payload.contains(&account.email));
+        if !verified {
+            crate::modules::logger::log_warn(&format!(
+                "[Desktop] Windows CredReadW verification mismatch for {}; retrying CredWriteW once",
+                account.email
+            ));
+            win_cred::write_generic_credential(
+                "gemini:antigravity",
+                "antigravity",
+                payload_json.as_bytes(),
+            )?;
+            let retry_ok = win_cred::read_generic_credential("gemini:antigravity")
+                .is_some_and(|payload| payload.contains(&account.email));
+            if !retry_ok {
+                return Err(format!(
+                    "Windows Credential Manager verification failed: stored gemini:antigravity does not contain {}",
+                    account.email
+                ));
             }
         }
     }
@@ -837,6 +807,149 @@ pub(crate) fn write_to_system_keyring(account: &crate::models::Account) -> Resul
     // 同步写入 ~/.gemini/ 目录下的文件凭据，兼容 SSH 会话、容器环境和无 Keyring/D-Bus 场景
     if let Err(e) = write_to_file_credentials(account, false) {
         crate::modules::logger::log_warn(&format!("[Desktop] File credential sync warning: {}", e));
+    }
+
+    Ok(())
+}
+
+fn collect_electron_user_data_dirs(effective_target: Option<&str>) -> Vec<std::path::PathBuf> {
+    let mut dirs_out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    let mut push_dir = |p: std::path::PathBuf| {
+        let key = p.to_string_lossy().to_lowercase();
+        if p.is_dir() && seen.insert(key) {
+            dirs_out.push(p);
+        }
+    };
+
+    if let Some(custom_dir) = process::get_user_data_dir_from_process(effective_target) {
+        push_dir(custom_dir);
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let base = std::path::PathBuf::from(appdata);
+        push_dir(base.join("Antigravity"));
+        push_dir(base.join("Antigravity IDE"));
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Some(home) = dirs::home_dir() {
+        let base = home.join("Library").join("Application Support");
+        push_dir(base.join("Antigravity"));
+        push_dir(base.join("Antigravity IDE"));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(cfg_dir) = dirs::config_dir() {
+            push_dir(cfg_dir.join("Antigravity"));
+            push_dir(cfg_dir.join("Antigravity IDE"));
+        }
+    }
+
+    dirs_out
+}
+
+pub(crate) fn sync_electron_app_storage_file(
+    app_storage_path: &std::path::Path,
+    account: &Account,
+) -> Result<(), String> {
+    let mut obj = if app_storage_path.exists() {
+        let raw = fs::read_to_string(app_storage_path)
+            .map_err(|e| format!("Failed to read {}: {}", app_storage_path.display(), e))?;
+        if raw.trim().is_empty() {
+            serde_json::Map::new()
+        } else {
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&raw)
+                .map_err(|e| format!("Failed to parse {}: {}", app_storage_path.display(), e))?
+        }
+    } else {
+        serde_json::Map::new()
+    };
+
+    obj.insert(
+        "agy.onboarding.lastLoginUsername".to_string(),
+        serde_json::Value::String(account.email.clone()),
+    );
+    obj.insert(
+        "agy.onboarding.lastLoginIsGcpTos".to_string(),
+        serde_json::Value::String(if account.token.is_gcp_tos {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        }),
+    );
+
+    let serialized = serde_json::to_string_pretty(&serde_json::Value::Object(obj))
+        .map_err(|e| format!("Failed to serialize app_storage.json: {}", e))?;
+
+    let tmp_path = app_storage_path.with_extension("json.tmp");
+    fs::write(&tmp_path, serialized.as_bytes())
+        .map_err(|e| format!("Failed to write {}: {}", tmp_path.display(), e))?;
+    if let Err(rename_err) = fs::rename(&tmp_path, app_storage_path) {
+        let write_res = fs::write(app_storage_path, serialized.as_bytes());
+        let _ = fs::remove_file(&tmp_path);
+        write_res.map_err(|e| {
+            format!(
+                "Failed to update {} (rename: {}; fallback write: {})",
+                app_storage_path.display(),
+                rename_err,
+                e
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+/// Syncs `app_storage.json` inside Antigravity userData directories so Electron onboarding
+/// reflects the active account (`agy.onboarding.lastLoginUsername` / `lastLoginIsGcpTos`).
+pub(crate) fn sync_electron_app_storage(
+    account: &Account,
+    effective_target: Option<&str>,
+) -> Result<(), String> {
+    let dirs = collect_electron_user_data_dirs(effective_target);
+    let mut last_err: Option<String> = None;
+    for dir in dirs {
+        let app_storage = dir.join("app_storage.json");
+        if let Err(e) = sync_electron_app_storage_file(&app_storage, account) {
+            crate::modules::logger::log_warn(&format!(
+                "[Desktop] app_storage.json sync failed for {:?}: {}",
+                app_storage, e
+            ));
+            last_err = Some(e);
+        }
+    }
+    if let Some(err) = last_err {
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Applies credentials headlessly without killing main UI windows (SQLite `state.vscdb`,
+/// system Keyring `gemini:antigravity`, `~/.gemini/jetski-standalone-oauth-token`,
+/// and `app_storage.json`). Used by ASAR auto-skip-login bootstrap.
+pub(crate) fn apply_credentials_headless(account: &Account) -> Result<(), String> {
+    let mut last_err: Option<String> = None;
+
+    if let Err(e) = apply_account_credentials(account, None, false, None) {
+        last_err = Some(e);
+    }
+
+    // If an explicit Antigravity IDE profile DB also exists, keep it synchronized too.
+    if let Ok(ide_db_path) = db::get_db_path(Some("ide")) {
+        if ide_db_path.exists() {
+            let _ = apply_account_credentials(account, Some("ide"), true, None);
+        }
+    }
+
+    if let Some(err) = last_err {
+        // Check if at least Keyring or file credentials succeeded before failing
+        let _ = write_to_file_credentials(account, false);
+        let _ = sync_electron_app_storage(account, None);
+        return Err(err);
     }
 
     Ok(())
@@ -1161,6 +1274,108 @@ fn verify_agy_credentials(expected: &str, stored: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+mod win_cred {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+
+    #[repr(C)]
+    struct FILETIME {
+        dw_low_date_time: u32,
+        dw_high_date_time: u32,
+    }
+
+    #[repr(C)]
+    struct CREDENTIALW {
+        flags: u32,
+        cred_type: u32,
+        target_name: *const u16,
+        comment: *const u16,
+        last_written: FILETIME,
+        credential_blob_size: u32,
+        credential_blob: *mut u8,
+        persist: u32,
+        attribute_count: u32,
+        attributes: *const std::ffi::c_void,
+        target_alias: *const u16,
+        user_name: *const u16,
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn CredWriteW(credential: *const CREDENTIALW, flags: u32) -> i32;
+        fn CredDeleteW(target_name: *const u16, type_: u32, flags: u32) -> i32;
+        fn CredReadW(
+            target_name: *const u16,
+            type_: u32,
+            flags: u32,
+            credential: *mut *mut CREDENTIALW,
+        ) -> i32;
+        fn CredFree(buffer: *mut std::ffi::c_void);
+    }
+
+    fn to_wide(s: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    pub(super) fn write_generic_credential(
+        target: &str,
+        user: &str,
+        secret: &[u8],
+    ) -> Result<(), String> {
+        let target_wide = to_wide(target);
+        let user_wide = to_wide(user);
+        let cred = CREDENTIALW {
+            flags: 0,
+            cred_type: 1, // CRED_TYPE_GENERIC
+            target_name: target_wide.as_ptr(),
+            comment: ptr::null(),
+            last_written: FILETIME {
+                dw_low_date_time: 0,
+                dw_high_date_time: 0,
+            },
+            credential_blob_size: secret.len() as u32,
+            credential_blob: secret.as_ptr() as *mut u8,
+            persist: 2, // CRED_PERSIST_LOCAL_MACHINE
+            attribute_count: 0,
+            attributes: ptr::null(),
+            target_alias: ptr::null(),
+            user_name: user_wide.as_ptr(),
+        };
+
+        unsafe {
+            let _ = CredDeleteW(target_wide.as_ptr(), 1, 0);
+            if CredWriteW(&cred, 0) == 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(format!("Windows CredWriteW failed: {}", err));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn read_generic_credential(target: &str) -> Option<String> {
+        let target_wide = to_wide(target);
+        let mut cred_ptr: *mut CREDENTIALW = ptr::null_mut();
+        unsafe {
+            let res = CredReadW(target_wide.as_ptr(), 1, 0, &mut cred_ptr);
+            if res == 0 || cred_ptr.is_null() {
+                return None;
+            }
+            let cred = &*cred_ptr;
+            let blob = std::slice::from_raw_parts(
+                cred.credential_blob,
+                cred.credential_blob_size as usize,
+            );
+            let payload_str = String::from_utf8_lossy(blob).to_string();
+            CredFree(cred_ptr as *mut std::ffi::c_void);
+            Some(payload_str)
+        }
+    }
+}
+
 fn read_system_credentials(
     allow_file_fallback: bool,
 ) -> Result<crate::modules::migration::ImportedOAuthState, String> {
@@ -1204,70 +1419,15 @@ fn read_system_credentials(
 
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::ffi::OsStrExt;
-        use std::ptr;
-
-        #[repr(C)]
-        struct FILETIME {
-            dw_low_date_time: u32,
-            dw_high_date_time: u32,
-        }
-
-        #[repr(C)]
-        struct CREDENTIALW {
-            flags: u32,
-            cred_type: u32,
-            target_name: *const u16,
-            comment: *const u16,
-            last_written: FILETIME,
-            credential_blob_size: u32,
-            credential_blob: *mut u8,
-            persist: u32,
-            attribute_count: u32,
-            attributes: *const std::ffi::c_void,
-            target_alias: *const u16,
-            user_name: *const u16,
-        }
-
-        #[link(name = "advapi32")]
-        extern "system" {
-            fn CredReadW(
-                target_name: *const u16,
-                type_: u32,
-                flags: u32,
-                credential: *mut *mut CREDENTIALW,
-            ) -> i32;
-            fn CredFree(buffer: *mut std::ffi::c_void);
-        }
-
-        let target = "gemini:antigravity";
-        let target_wide: Vec<u16> = std::ffi::OsStr::new(target)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-
-        let mut cred_ptr: *mut CREDENTIALW = ptr::null_mut();
-        unsafe {
-            let res = CredReadW(target_wide.as_ptr(), 1, 0, &mut cred_ptr);
-            if res == 0 || cred_ptr.is_null() {
-                if allow_file_fallback {
-                    if let Ok(file_state) = read_from_file_credentials() {
-                        return Ok(file_state);
-                    }
-                }
-                return Err("No credential found in Windows Credential Manager".to_string());
-            }
-
-            let cred = &*cred_ptr;
-            let blob = std::slice::from_raw_parts(
-                cred.credential_blob,
-                cred.credential_blob_size as usize,
-            );
-            let payload_str = String::from_utf8_lossy(blob).to_string();
-            CredFree(cred_ptr as *mut std::ffi::c_void);
-
+        if let Some(payload_str) = win_cred::read_generic_credential("gemini:antigravity") {
             return parse_keyring_payload(&payload_str);
         }
+        if allow_file_fallback {
+            if let Ok(file_state) = read_from_file_credentials() {
+                return Ok(file_state);
+            }
+        }
+        return Err("No credential found in Windows Credential Manager".to_string());
     }
 
     #[cfg(target_os = "linux")]
@@ -2601,5 +2761,43 @@ mod tests {
 
         std::env::remove_var("GEMINI_HOME");
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_sync_electron_app_storage_preserves_existing_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let app_storage = dir.path().join("app_storage.json");
+        std::fs::write(
+            &app_storage,
+            r#"{"aux-pane-v2-session":{"kept":true},"agy.onboarding.lastLoginUsername":"old@example.com"}"#,
+        )
+        .unwrap();
+
+        let token = crate::models::TokenData::new(
+            "ya29.test".to_string(),
+            "1//refresh".to_string(),
+            3600,
+            Some("new@example.com".to_string()),
+            None,
+            None,
+            false,
+            None,
+        );
+        let account = crate::models::Account::new(
+            "acc-storage".to_string(),
+            "new@example.com".to_string(),
+            token,
+        );
+
+        sync_electron_app_storage_file(&app_storage, &account).unwrap();
+
+        let updated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&app_storage).unwrap()).unwrap();
+        assert_eq!(updated["aux-pane-v2-session"]["kept"], true);
+        assert_eq!(
+            updated["agy.onboarding.lastLoginUsername"],
+            "new@example.com"
+        );
+        assert_eq!(updated["agy.onboarding.lastLoginIsGcpTos"], "false");
     }
 }

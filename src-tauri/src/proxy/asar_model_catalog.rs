@@ -928,6 +928,33 @@ fn richest_upstream_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("asar_richest_upstream.json"))
 }
 
+fn is_valid_grouped_model_entry(val: &Value) -> bool {
+    let Some(obj) = val.as_object() else {
+        return false;
+    };
+    let Some(levels_val) = obj.get("supportedThinkingLevels") else {
+        return true;
+    };
+    let Some(levels) = levels_val.as_array() else {
+        return false;
+    };
+    levels.iter().all(|item| {
+        item.as_object().is_some_and(|lvl| {
+            lvl.get("thinkingSuffix")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty())
+                && lvl
+                    .get("thinkingDisplayName")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.trim().is_empty())
+        })
+    })
+}
+
+fn sanitize_grouped_models_map(grouped: &mut Map<String, Value>) {
+    grouped.retain(|_, v| is_valid_grouped_model_entry(v));
+}
+
 fn load_richest_from_disk() -> Option<RichestUpstream> {
     if cfg!(test) {
         return None;
@@ -939,13 +966,13 @@ fn load_richest_from_disk() -> Option<RichestUpstream> {
     let Some(Value::Object(models)) = root.get("models").cloned() else {
         return None;
     };
-    // Invalidate legacy cache files that predate `groupedModels` capture so they re-save with it.
-    let Some(Value::Object(grouped_models)) = root.get("groupedModels").cloned() else {
-        return None;
-    };
-    if grouped_models.is_empty() {
-        return None;
-    }
+    // Do NOT reject cache files that omit `groupedModels`; strip any poisoned bare-string entries.
+    let mut grouped_models = root
+        .get("groupedModels")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    sanitize_grouped_models_map(&mut grouped_models);
     let sorts = root
         .get("agentModelSorts")
         .cloned()
@@ -978,11 +1005,12 @@ fn remember_richest_upstream(root: &Map<String, Value>) {
         .get("agentModelSorts")
         .cloned()
         .unwrap_or(Value::Array(Vec::new()));
-    let grouped_models = root
+    let mut grouped_models = root
         .get("groupedModels")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    sanitize_grouped_models_map(&mut grouped_models);
     let experiment_ids = root.get("experimentIds").cloned();
     let shared_model_experiments = root.get("sharedModelExperiments").cloned();
 
@@ -1010,7 +1038,9 @@ fn remember_richest_upstream(root: &Map<String, Value>) {
         let mut payload = Map::new();
         payload.insert("models".to_string(), Value::Object(models.clone()));
         payload.insert("agentModelSorts".to_string(), sorts);
-        payload.insert("groupedModels".to_string(), Value::Object(grouped_models));
+        if !grouped_models.is_empty() {
+            payload.insert("groupedModels".to_string(), Value::Object(grouped_models));
+        }
         if let Some(exp) = experiment_ids {
             payload.insert("experimentIds".to_string(), exp);
         }
@@ -1053,10 +1083,15 @@ fn merge_richest_into_response(original_json: &str, richest: &RichestUpstream) -
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
+        sanitize_grouped_models_map(&mut grouped);
         for (k, v) in &richest.grouped_models {
-            grouped.entry(k.clone()).or_insert_with(|| v.clone());
+            if is_valid_grouped_model_entry(v) {
+                grouped.entry(k.clone()).or_insert_with(|| v.clone());
+            }
         }
-        root.insert("groupedModels".to_string(), Value::Object(grouped));
+        if !grouped.is_empty() {
+            root.insert("groupedModels".to_string(), Value::Object(grouped));
+        }
     }
     if let Some(exp) = &richest.experiment_ids {
         root.entry("experimentIds".to_string())
@@ -1598,31 +1633,41 @@ fn family_display_name_from_id(
 }
 
 /// Ensures `root_obj["groupedModels"]` has an entry for every active tiered model family
-/// (`<family>-low`, `-medium`, `-high`, `-xhigh`) present in `normalized_models`.
+/// (`<family>-low`, `-medium`, `-high`, `-xhigh`) present in `normalized_models`,
+/// using the exact Google `FetchAvailableModelsResponse` protojson schema:
+/// `supportedThinkingLevels: [{ "thinkingSuffix": "low", "thinkingDisplayName": "Low" }, ...]`.
 fn ensure_grouped_models_complete(
     root_obj: &mut Map<String, Value>,
     normalized_models: &Map<String, Value>,
 ) {
-    const TIER_SUFFIXES: [(&str, &str); 4] = [
-        ("-low", "LOW"),
-        ("-medium", "MEDIUM"),
-        ("-high", "HIGH"),
-        ("-xhigh", "XHIGH"),
+    const TIER_SUFFIXES: [(&str, &str, &str, usize); 4] = [
+        ("-low", "low", "Low", 0),
+        ("-medium", "medium", "Medium", 1),
+        ("-high", "high", "High", 2),
+        ("-xhigh", "xhigh", "Extra High", 3),
     ];
 
-    let mut families: HashMap<String, (Vec<&'static str>, Option<&Map<String, Value>>)> =
-        HashMap::new();
+    let mut families: HashMap<
+        String,
+        (
+            Vec<(&'static str, &'static str, usize)>,
+            Option<&Map<String, Value>>,
+        ),
+    > = HashMap::new();
 
     for (model_id, val) in normalized_models {
         let lower = model_id.to_ascii_lowercase();
-        for &(suffix, level) in &TIER_SUFFIXES {
+        for &(suffix, thinking_suffix, thinking_display, order_idx) in &TIER_SUFFIXES {
             if let Some(prefix_len) = lower.strip_suffix(suffix).map(|s| s.len()) {
                 let family_id = model_id[..prefix_len].to_string();
+                if family_id.to_ascii_lowercase().ends_with("-tiered") {
+                    break;
+                }
                 let entry = families
                     .entry(family_id)
                     .or_insert_with(|| (Vec::new(), None));
-                if !entry.0.contains(&level) {
-                    entry.0.push(level);
+                if !entry.0.iter().any(|(s, _, _)| *s == thinking_suffix) {
+                    entry.0.push((thinking_suffix, thinking_display, order_idx));
                 }
                 if entry.1.is_none() || suffix == "-medium" {
                     entry.1 = val.as_object();
@@ -1632,32 +1677,41 @@ fn ensure_grouped_models_complete(
         }
     }
 
-    if families.is_empty() {
-        return;
-    }
-
     let mut grouped = match root_obj.remove("groupedModels") {
-        Some(Value::Object(m)) => m,
+        Some(Value::Object(mut m)) => {
+            sanitize_grouped_models_map(&mut m);
+            m
+        }
         _ => Map::new(),
     };
 
-    let order = ["LOW", "MEDIUM", "HIGH", "XHIGH"];
     for (family_id, (mut levels, sample_node)) in families {
-        if grouped.contains_key(&family_id) {
+        if levels.len() < 2 || grouped.contains_key(&family_id) {
             continue;
         }
-        levels.sort_by_key(|lvl| order.iter().position(|o| o == lvl).unwrap_or(99));
+        levels.sort_by_key(|(_, _, idx)| *idx);
         let display_name = family_display_name_from_id(&family_id, sample_node);
+        let level_objs: Vec<Value> = levels
+            .into_iter()
+            .map(|(thinking_suffix, thinking_display, _)| {
+                json!({
+                    "thinkingSuffix": thinking_suffix,
+                    "thinkingDisplayName": thinking_display,
+                })
+            })
+            .collect();
         grouped.insert(
             family_id,
             json!({
                 "displayName": display_name,
-                "supportedThinkingLevels": levels,
+                "supportedThinkingLevels": level_objs,
             }),
         );
     }
 
-    root_obj.insert("groupedModels".to_string(), Value::Object(grouped));
+    if !grouped.is_empty() {
+        root_obj.insert("groupedModels".to_string(), Value::Object(grouped));
+    }
 }
 
 fn sync_agent_model_sorts(
@@ -1927,11 +1981,20 @@ mod tests {
             grouped_models: json!({
                 "gemini-4-carbon": {
                     "displayName": "Gemini 4 Carbon",
-                    "supportedThinkingLevels": ["LOW", "MEDIUM", "HIGH", "XHIGH"]
+                    "supportedThinkingLevels": [
+                        { "thinkingSuffix": "low", "thinkingDisplayName": "Low" },
+                        { "thinkingSuffix": "medium", "thinkingDisplayName": "Medium" },
+                        { "thinkingSuffix": "high", "thinkingDisplayName": "High" },
+                        { "thinkingSuffix": "xhigh", "thinkingDisplayName": "Extra High" }
+                    ]
                 },
                 "claude-opus-5-5": {
                     "displayName": "Claude Opus 5.5",
-                    "supportedThinkingLevels": ["LOW", "MEDIUM", "HIGH"]
+                    "supportedThinkingLevels": [
+                        { "thinkingSuffix": "low", "thinkingDisplayName": "Low" },
+                        { "thinkingSuffix": "medium", "thinkingDisplayName": "Medium" },
+                        { "thinkingSuffix": "high", "thinkingDisplayName": "High" }
+                    ]
                 }
             })
             .as_object()
@@ -1948,7 +2011,10 @@ mod tests {
             "groupedModels": {
                 "gemini-4-hydrogen": {
                     "displayName": "Gemini 4 Hydrogen",
-                    "supportedThinkingLevels": ["LOW", "HIGH"]
+                    "supportedThinkingLevels": [
+                        { "thinkingSuffix": "low", "thinkingDisplayName": "Low" },
+                        { "thinkingSuffix": "high", "thinkingDisplayName": "High" }
+                    ]
                 }
             },
             "agentModelSorts": [{
@@ -1988,12 +2054,21 @@ mod tests {
                 "gemini-4-carbon-medium": { "displayName": "Gemini 4 Carbon (Medium)" },
                 "gemini-4-carbon-high": { "displayName": "Gemini 4 Carbon (High)" },
                 "claude-sonnet-5-5-low": { "displayName": "Claude Sonnet 5.5 (Low)" },
-                "claude-sonnet-5-5-medium": { "displayName": "Claude Sonnet 5.5 (Medium)" }
+                "claude-sonnet-5-5-medium": { "displayName": "Claude Sonnet 5.5 (Medium)" },
+                "gemini-4-hydrogen-tiered-high": { "displayName": "Internal Tiered High" },
+                "gemini-4-hydrogen-tiered-xhigh": { "displayName": "Internal Tiered XHigh" }
             },
             "groupedModels": {
                 "gemini-4-hydrogen": {
                     "displayName": "Custom Hydrogen",
-                    "supportedThinkingLevels": ["LOW", "HIGH"]
+                    "supportedThinkingLevels": [
+                        { "thinkingSuffix": "low", "thinkingDisplayName": "Low" },
+                        { "thinkingSuffix": "high", "thinkingDisplayName": "High" }
+                    ]
+                },
+                "gemini-4-carbon": {
+                    "displayName": "Poisoned Carbon",
+                    "supportedThinkingLevels": ["MEDIUM", "HIGH"]
                 }
             }
         })
@@ -2002,16 +2077,19 @@ mod tests {
         let out: Value =
             serde_json::from_str(&inject_with_catalog(&basic, &[], &HashMap::new())).unwrap();
         let grouped = out["groupedModels"].as_object().unwrap();
-        // Existing entry is preserved untouched
+        // Existing valid entry is preserved untouched
         assert_eq!(
             grouped["gemini-4-hydrogen"]["displayName"],
             "Custom Hydrogen"
         );
-        // Missing tiered families are synthesized
+        // Poisoned bare-string entry is stripped & re-synthesized with valid proto objects
         assert_eq!(grouped["gemini-4-carbon"]["displayName"], "Gemini 4 Carbon");
         assert_eq!(
             grouped["gemini-4-carbon"]["supportedThinkingLevels"],
-            json!(["MEDIUM", "HIGH"])
+            json!([
+                { "thinkingSuffix": "medium", "thinkingDisplayName": "Medium" },
+                { "thinkingSuffix": "high", "thinkingDisplayName": "High" }
+            ])
         );
         assert_eq!(
             grouped["claude-sonnet-5-5"]["displayName"],
@@ -2019,8 +2097,81 @@ mod tests {
         );
         assert_eq!(
             grouped["claude-sonnet-5-5"]["supportedThinkingLevels"],
-            json!(["LOW", "MEDIUM"])
+            json!([
+                { "thinkingSuffix": "low", "thinkingDisplayName": "Low" },
+                { "thinkingSuffix": "medium", "thinkingDisplayName": "Medium" }
+            ])
         );
+        // Internal `-tiered` family must NOT be added to groupedModels
+        assert!(!grouped.contains_key("gemini-4-hydrogen-tiered"));
+    }
+
+    #[test]
+    fn test_grouped_models_never_emit_bare_string_tokens() {
+        let (_dir, cat) = temp_catalog();
+        for (id, name) in [
+            ("gemini-4-carbon-low", "Gemini 4 Carbon (Low)"),
+            ("gemini-4-carbon-medium", "Gemini 4 Carbon (Medium)"),
+            ("gemini-4-carbon-high", "Gemini 4 Carbon (High)"),
+            ("gemini-4-neon-xhigh", "Gemini 4 Neon (XHigh)"),
+            ("gemini-4-neon-low", "Gemini 4 Neon (Low)"),
+        ] {
+            cat.upsert_model(CatalogModelEntry {
+                id: id.to_string(),
+                display_name: name.to_string(),
+                enabled: true,
+                owned_by: "google".to_string(),
+                provider_id: "default_google_pool".to_string(),
+                provider_name: "Google Account Pool".to_string(),
+                target_model: id.to_string(),
+                context_window: 1_048_576,
+                max_input_tokens: 1_048_576,
+                max_output_tokens: 65_536,
+                supports_thinking: true,
+                supports_vision: true,
+                supports_audio: true,
+                supports_video: true,
+                supports_function_calling: true,
+                input_pricing: 0.15,
+                output_pricing: 0.60,
+                description: DESC_SYNCED_POOL.to_string(),
+                order: 10,
+            })
+            .unwrap();
+        }
+
+        let check_valid_grouped = |raw_json: &str| {
+            let parsed: Value = serde_json::from_str(raw_json).unwrap();
+            if let Some(grouped) = parsed.get("groupedModels").and_then(Value::as_object) {
+                for (family, entry) in grouped {
+                    assert!(
+                        is_valid_grouped_model_entry(entry),
+                        "groupedModels[{}] has invalid proto schema: {}",
+                        family,
+                        entry
+                    );
+                    if let Some(levels) = entry
+                        .get("supportedThinkingLevels")
+                        .and_then(Value::as_array)
+                    {
+                        for item in levels {
+                            assert!(
+                                item.is_object(),
+                                "groupedModels[{}] emitted bare token instead of proto object: {}",
+                                family,
+                                item
+                            );
+                        }
+                    }
+                }
+            }
+        };
+
+        let injected = cat.inject_models_into_fetch_response(r#"{"models":{}}"#);
+        check_valid_grouped(&injected);
+
+        let synthetic = cat.create_synthetic_available_models_response();
+        check_valid_grouped(&synthetic);
     }
 
     #[test]

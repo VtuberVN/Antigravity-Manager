@@ -1094,6 +1094,7 @@ pub fn run() {
             commands::asar::get_asar_status,
             commands::asar::patch_asar,
             commands::asar::unpatch_asar,
+            commands::asar::set_asar_terminate_processes,
             commands::asar::toggle_asar_heartbeat,
             commands::asar::set_asar_bridge_port,
             commands::asar::get_asar_bridge_status,
@@ -1112,6 +1113,7 @@ pub fn run() {
             commands::asar::set_asar_equivalent_fallback,
             commands::asar::set_asar_cross_family_fallback,
             commands::asar::set_asar_separate_lite_slot,
+            commands::asar::set_asar_skip_ide_login,
             commands::asar::reset_asar_slots,
             commands::asar::refresh_ide_models,
         ])

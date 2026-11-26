@@ -951,9 +951,9 @@ function Accounts() {
       />
 
       {/* 顶部工具栏:搜索、过滤和操作按钮 */}
-      <div className="flex-none flex items-center gap-2 min-w-0">
+      <div className="flex-none flex items-center gap-1.5 min-w-0">
         {/* 搜索框 - 响应式:大屏显示输入框,小屏显示图标 */}
-        <div className="hidden lg:block flex-none w-40 relative transition-all focus-within:w-48">
+        <div className="hidden lg:block flex-none w-36 relative transition-all focus-within:w-44">
           <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400" />
           <input
             type="text"
@@ -1024,11 +1024,18 @@ function Accounts() {
         </div>
 
         {/* 过滤按钮组 - 图标化响应式 (min-w-0 可横向滑动，避免挤压右侧操作栏) */}
-        <div className="flex gap-0.5 bg-gray-100/80 dark:bg-base-200 p-1 rounded-xl border border-gray-200/50 dark:border-white/5 min-w-0 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-          {/* 全部 */}
+        <div
+          className="flex gap-0.5 bg-gray-100/80 dark:bg-base-200 p-1 rounded-xl border border-gray-200/50 dark:border-white/5 min-w-0 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          onWheel={(e) => {
+            if (e.deltaY !== 0) {
+              e.currentTarget.scrollLeft += e.deltaY;
+            }
+          }}
+        >
+          {/* Tất cả */}
           <button
             className={cn(
-              "px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all flex items-center gap-1 whitespace-nowrap shrink-0",
+              "px-2 py-1 rounded-lg text-[11px] font-semibold transition-all flex items-center gap-1 whitespace-nowrap shrink-0",
               filter === 'all'
                 ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-black/5"
                 : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content hover:bg-white/40"
@@ -1047,10 +1054,32 @@ function Accounts() {
             </span>
           </button>
 
+          {/* ULTRA (luôn hiển thị trước PRO) */}
+          <button
+            className={cn(
+              "flex px-2 py-1 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 whitespace-nowrap shrink-0",
+              filter === 'ultra'
+                ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-black/5"
+                : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content hover:bg-white/40"
+            )}
+            onClick={() => setFilter('ultra')}
+            title={`${t('accounts.ultra')} (${filterCounts.ultra})`}
+          >
+            <span className="hidden md:inline">{t('accounts.ultra')}</span>
+            <span className={cn(
+              "px-1.5 py-0.5 rounded-md text-[10px] font-bold transition-colors",
+              filter === 'ultra'
+                ? "bg-blue-100 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400"
+                : "bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400"
+            )}>
+              {filterCounts.ultra}
+            </span>
+          </button>
+
           {/* PRO */}
           <button
             className={cn(
-              "px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all flex items-center gap-1 whitespace-nowrap shrink-0",
+              "px-2 py-1 rounded-lg text-[11px] font-semibold transition-all flex items-center gap-1 whitespace-nowrap shrink-0",
               filter === 'pro'
                 ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-black/5"
                 : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content hover:bg-white/40"
@@ -1069,35 +1098,11 @@ function Accounts() {
             </span>
           </button>
 
-          {/* ULTRA (仅在数量 > 0 或已选中时显示，节省工具栏空间) */}
-          {(filterCounts.ultra > 0 || filter === 'ultra') && (
-            <button
-              className={cn(
-                "flex px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 whitespace-nowrap shrink-0",
-                filter === 'ultra'
-                  ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-black/5"
-                  : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content hover:bg-white/40"
-              )}
-              onClick={() => setFilter('ultra')}
-              title={`${t('accounts.ultra')} (${filterCounts.ultra})`}
-            >
-              <span className="hidden md:inline">{t('accounts.ultra')}</span>
-              <span className={cn(
-                "px-1.5 py-0.5 rounded-md text-[10px] font-bold transition-colors",
-                filter === 'ultra'
-                  ? "bg-blue-100 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400"
-                  : "bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400"
-              )}>
-                {filterCounts.ultra}
-              </span>
-            </button>
-          )}
-
-          {/* ENTERPRISE (仅在数量 > 0 或已选中时显示，节省工具栏空间) */}
+          {/* ENTERPRISE (仅在数量 > 0 或已选中时显示) */}
           {(filterCounts.enterprise > 0 || filter === 'enterprise') && (
             <button
               className={cn(
-                "flex px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 whitespace-nowrap shrink-0",
+                "flex px-2 py-1 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 whitespace-nowrap shrink-0",
                 filter === 'enterprise'
                   ? "bg-white dark:bg-base-100 text-emerald-600 dark:text-emerald-400 shadow-sm ring-1 ring-black/5"
                   : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content hover:bg-white/40"
@@ -1117,34 +1122,32 @@ function Accounts() {
             </button>
           )}
 
-          {/* FREE (仅在数量 > 0 或已选中时显示，节省工具栏空间) */}
-          {(filterCounts.free > 0 || filter === 'free') && (
-            <button
-              className={cn(
-                "flex px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 whitespace-nowrap shrink-0",
-                filter === 'free'
-                  ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-black/5"
-                  : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content hover:bg-white/40"
-              )}
-              onClick={() => setFilter('free')}
-              title={`${t('accounts.free')} (${filterCounts.free})`}
-            >
-              <span className="hidden md:inline">{t('accounts.free')}</span>
-              <span className={cn(
-                "px-1.5 py-0.5 rounded-md text-[10px] font-bold transition-colors",
-                filter === 'free'
-                  ? "bg-blue-100 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400"
-                  : "bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400"
-              )}>
-                {filterCounts.free}
-              </span>
-            </button>
-          )}
+          {/* MIỄN PHÍ / FREE (luôn hiển thị) */}
+          <button
+            className={cn(
+              "flex px-2 py-1 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 whitespace-nowrap shrink-0",
+              filter === 'free'
+                ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-black/5"
+                : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content hover:bg-white/40"
+            )}
+            onClick={() => setFilter('free')}
+            title={`${t('accounts.free')} (${filterCounts.free})`}
+          >
+            <span className="hidden md:inline">{t('accounts.free')}</span>
+            <span className={cn(
+              "px-1.5 py-0.5 rounded-md text-[10px] font-bold transition-colors",
+              filter === 'free'
+                ? "bg-blue-100 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400"
+                : "bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400"
+            )}>
+              {filterCounts.free}
+            </span>
+          </button>
 
           {/* Bị Ban / 403 */}
           <button
             className={cn(
-              "flex px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 whitespace-nowrap shrink-0",
+              "flex px-2 py-1 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 whitespace-nowrap shrink-0",
               filter === 'abnormal'
                 ? "bg-white dark:bg-base-100 text-rose-600 dark:text-rose-400 shadow-sm ring-1 ring-rose-500/20"
                 : filterCounts.abnormal > 0
@@ -1167,10 +1170,10 @@ function Accounts() {
             </span>
           </button>
 
-          {/* 需要验证 / 手机验证 */}
+          {/* Need Verify */}
           <button
             className={cn(
-              "flex px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 whitespace-nowrap shrink-0",
+              "flex px-2 py-1 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 whitespace-nowrap shrink-0",
               filter === 'need_verify'
                 ? "bg-white dark:bg-base-100 text-amber-600 dark:text-amber-400 shadow-sm ring-1 ring-amber-500/20"
                 : filterCounts.need_verify > 0
@@ -1195,46 +1198,46 @@ function Accounts() {
         </div>
 
         {/* 操作按钮组 */}
-        <div className="flex items-center gap-1.5 shrink-0 ml-auto">
+        <div className="flex items-center gap-1 shrink-0 ml-auto">
           <AddAccountDialog onAdd={handleAddAccount} showText={false} />
 
           {selectedIds.size > 0 && (
             <>
               <button
-                className="px-2.5 py-2 bg-red-500 text-white text-xs font-medium rounded-lg hover:bg-red-600 transition-colors flex items-center gap-1.5 shadow-sm"
+                className="px-2 py-2 bg-red-500 text-white text-xs font-medium rounded-lg hover:bg-red-600 transition-colors flex items-center gap-1 shadow-sm shrink-0"
                 onClick={handleBatchDelete}
                 title={t("accounts.delete_selected", {
                   count: selectedIds.size,
                 })}
               >
                 <Trash2 className="w-3.5 h-3.5" />
-                <span className="hidden xl:inline">
+                <span className="hidden 2xl:inline">
                   {t("accounts.delete_selected", { count: selectedIds.size })}
                 </span>
               </button>
               <button
-                className="px-2.5 py-2 bg-orange-500 text-white text-xs font-medium rounded-lg hover:bg-orange-600 transition-colors flex items-center gap-1.5 shadow-sm"
+                className="px-2 py-2 bg-orange-500 text-white text-xs font-medium rounded-lg hover:bg-orange-600 transition-colors flex items-center gap-1 shadow-sm shrink-0"
                 onClick={() => handleBatchToggleProxy(false)}
                 title={t("accounts.disable_proxy_selected", {
                   count: selectedIds.size,
                 })}
               >
                 <ToggleLeft className="w-3.5 h-3.5" />
-                <span className="hidden xl:inline">
+                <span className="hidden 2xl:inline">
                   {t("accounts.disable_proxy_selected", {
                     count: selectedIds.size,
                   })}
                 </span>
               </button>
               <button
-                className="px-2.5 py-2 bg-green-500 text-white text-xs font-medium rounded-lg hover:bg-green-600 transition-colors flex items-center gap-1.5 shadow-sm"
+                className="px-2 py-2 bg-green-500 text-white text-xs font-medium rounded-lg hover:bg-green-600 transition-colors flex items-center gap-1 shadow-sm shrink-0"
                 onClick={() => handleBatchToggleProxy(true)}
                 title={t("accounts.enable_proxy_selected", {
                   count: selectedIds.size,
                 })}
               >
                 <ToggleRight className="w-3.5 h-3.5" />
-                <span className="hidden xl:inline">
+                <span className="hidden 2xl:inline">
                   {t("accounts.enable_proxy_selected", {
                     count: selectedIds.size,
                   })}
@@ -1250,7 +1253,7 @@ function Accounts() {
           />
 
           <button
-            className={`px-2.5 py-2 bg-orange-500 text-white text-xs font-medium rounded-lg hover:bg-orange-600 transition-colors flex items-center gap-1.5 shadow-sm ${isWarmuping ? "opacity-70 cursor-not-allowed" : ""}`}
+            className={`px-2 py-2 bg-orange-500 text-white text-xs font-medium rounded-lg hover:bg-orange-600 transition-colors flex items-center gap-1 shadow-sm shrink-0 ${isWarmuping ? "opacity-70 cursor-not-allowed" : ""}`}
             onClick={() => {
               setWarmupTargetAccountId(null);
               setIsWarmupConfirmOpen(true);
@@ -1274,10 +1277,10 @@ function Accounts() {
             </span>
           </button>
 
-          <div className="w-px h-4 bg-gray-200 dark:bg-gray-700 self-center mx-1 shrink-0"></div>
+          <div className="w-px h-4 bg-gray-200 dark:bg-gray-700 self-center mx-0.5 shrink-0"></div>
 
           <button
-            className="px-2.5 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 text-xs font-medium rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 transition-colors flex items-center gap-1.5"
+            className="px-2 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 text-xs font-medium rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 transition-colors flex items-center gap-1 shrink-0"
             onClick={handleImportJson}
             title={t("accounts.import_json")}
           >
@@ -1288,7 +1291,7 @@ function Accounts() {
           </button>
 
           <button
-            className="px-2.5 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 text-xs font-medium rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 transition-colors flex items-center gap-1.5"
+            className="px-2 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 text-xs font-medium rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 transition-colors flex items-center gap-1 shrink-0"
             onClick={handleExport}
             title={
               selectedIds.size > 0

@@ -15,10 +15,26 @@ pub async fn patch_asar(
     port: Option<u16>,
     terminate_processes: Option<bool>,
 ) -> Result<PatchResult, String> {
-    let terminate = terminate_processes.unwrap_or(true);
-    tokio::task::spawn_blocking(move || asar_patch::patch_asar_direct(port, terminate))
-        .await
-        .map_err(|e| format!("Task panicked: {}", e))
+    let terminate = match terminate_processes {
+        Some(v) => {
+            let _ = tokio::task::spawn_blocking(move || {
+                asar_patch::persist_terminate_processes_flag(v)
+            })
+            .await;
+            v
+        }
+        None => tokio::task::spawn_blocking(asar_patch::get_terminate_processes_flag)
+            .await
+            .unwrap_or(true),
+    };
+    let result =
+        tokio::task::spawn_blocking(move || asar_patch::patch_asar_direct(port, terminate))
+            .await
+            .map_err(|e| format!("Task panicked: {}", e))?;
+    if result.success {
+        bootstrap_asar_ide_credentials_if_needed().await;
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -26,10 +42,31 @@ pub async fn unpatch_asar(
     port: Option<u16>,
     terminate_processes: Option<bool>,
 ) -> Result<PatchResult, String> {
-    let terminate = terminate_processes.unwrap_or(true);
+    let terminate = match terminate_processes {
+        Some(v) => {
+            let _ = tokio::task::spawn_blocking(move || {
+                asar_patch::persist_terminate_processes_flag(v)
+            })
+            .await;
+            v
+        }
+        None => tokio::task::spawn_blocking(asar_patch::get_terminate_processes_flag)
+            .await
+            .unwrap_or(true),
+    };
     tokio::task::spawn_blocking(move || asar_patch::restore_original_asar(port, terminate))
         .await
         .map_err(|e| format!("Task panicked: {}", e))
+}
+
+#[tauri::command]
+pub async fn set_asar_terminate_processes(enabled: bool) -> Result<bool, String> {
+    tokio::task::spawn_blocking(move || {
+        asar_patch::persist_terminate_processes_flag(enabled)?;
+        Ok::<bool, String>(asar_patch::get_terminate_processes_flag())
+    })
+    .await
+    .map_err(|e| format!("Task panicked: {}", e))?
 }
 
 #[tauri::command]
@@ -111,6 +148,7 @@ pub async fn start_asar_bridge(
         cfg.proxy.asar_bridge_port = target_port;
         let _ = crate::modules::config::save_app_config(&cfg);
     }
+    bootstrap_asar_ide_credentials_if_needed().await;
     Ok(status)
 }
 
@@ -250,6 +288,167 @@ pub async fn set_asar_separate_lite_slot(
 }
 
 #[tauri::command]
+pub async fn set_asar_skip_ide_login(
+    enabled: bool,
+    proxy_state: State<'_, crate::commands::proxy::ProxyServiceState>,
+) -> Result<AsarTelemetrySnapshot, String> {
+    asar_bridge::set_skip_ide_login_enabled(enabled);
+    if enabled {
+        bootstrap_asar_ide_credentials_if_needed().await;
+    }
+    let app_state = current_app_state(&proxy_state).await;
+    Ok(asar_bridge::snapshot_asar_telemetry(app_state.as_ref()).await)
+}
+
+fn read_active_jetski_credential_email() -> Option<(String, String)> {
+    let home = dirs::home_dir()?;
+    let path = home.join(".gemini").join("jetski-standalone-oauth-token");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let email = val
+        .get("id_token_email")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    let refresh_token = val
+        .get("token")
+        .and_then(|t| t.get("refresh_token"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    Some((email, refresh_token))
+}
+
+fn bootstrap_tier_rank(tier: Option<&str>) -> u8 {
+    match tier.unwrap_or("").trim().to_ascii_uppercase().as_str() {
+        "ULTRA" => 0,
+        "PRO" => 1,
+        _ => 2,
+    }
+}
+
+fn is_account_healthy_for_bootstrap(acc: &crate::models::Account) -> bool {
+    !acc.disabled
+        && !acc.banned
+        && !acc.validation_blocked
+        && !acc.quota.as_ref().is_some_and(|q| q.is_forbidden)
+        && !acc.token.refresh_token.trim().is_empty()
+}
+
+/// Automatically bootstraps healthy IDE credentials when ASAR bridge + skip-login mode are enabled,
+/// ONLY when no credential exists yet or the active credential belongs to a disabled/blocked/forbidden account.
+pub async fn bootstrap_asar_ide_credentials_if_needed() {
+    let should_run = tokio::task::spawn_blocking(|| {
+        asar_patch::get_skip_ide_login_flag() && asar_patch::is_patched(None)
+    })
+    .await
+    .unwrap_or(false);
+    if !should_run {
+        return;
+    }
+
+    let candidate_opt = tokio::task::spawn_blocking(|| {
+        let accounts = crate::modules::account::list_accounts().unwrap_or_default();
+        let current_acc_id = crate::modules::account::get_current_account_id()
+            .ok()
+            .flatten();
+        let active_cred = read_active_jetski_credential_email();
+
+        if let Some((ref active_email, _)) = active_cred {
+            if let Some(matched) = accounts
+                .iter()
+                .find(|a| a.email.eq_ignore_ascii_case(active_email))
+            {
+                if is_account_healthy_for_bootstrap(matched) {
+                    tracing::debug!(
+                        "[ASAR-SkipLogin] Active IDE credential ({}) is already healthy; skipping bootstrap.",
+                        active_email
+                    );
+                    return None;
+                }
+                tracing::info!(
+                    "[ASAR-SkipLogin] Active IDE credential ({}) is disabled/blocked/forbidden; bootstrapping healthy replacement.",
+                    active_email
+                );
+            } else {
+                // External/manual IDE login not in pool — never clobber it
+                tracing::debug!(
+                    "[ASAR-SkipLogin] Active IDE credential ({}) is external; preserving existing login.",
+                    active_email
+                );
+                return None;
+            }
+        } else if let Some(ref cur_id) = current_acc_id {
+            if let Some(matched) = accounts.iter().find(|a| &a.id == cur_id) {
+                if is_account_healthy_for_bootstrap(matched) {
+                    // File credential missing even though current account is healthy -> bootstrap it
+                    return Some(matched.clone());
+                }
+            }
+        }
+
+        let mut healthy: Vec<crate::models::Account> = accounts
+            .into_iter()
+            .filter(is_account_healthy_for_bootstrap)
+            .collect();
+        healthy.sort_by_key(|a| {
+            let tier = a
+                .quota
+                .as_ref()
+                .and_then(|q| q.subscription_tier.as_deref());
+            (bootstrap_tier_rank(tier), a.priority)
+        });
+        healthy.into_iter().next()
+    })
+    .await
+    .ok()
+    .flatten();
+
+    let Some(mut best) = candidate_opt else {
+        return;
+    };
+
+    if let Ok(fresh_token) =
+        crate::modules::oauth::ensure_fresh_token(&best.token, Some(&best.id)).await
+    {
+        if fresh_token.access_token != best.token.access_token
+            || fresh_token.expiry_timestamp != best.token.expiry_timestamp
+        {
+            best.token = fresh_token;
+            let best_clone = best.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::modules::account::save_account(&best_clone)
+            })
+            .await;
+        }
+    }
+
+    let email = best.email.clone();
+    match tokio::task::spawn_blocking(move || {
+        crate::modules::integration::apply_credentials_headless(&best)
+    })
+    .await
+    {
+        Ok(Ok(())) => {
+            tracing::info!(
+                "[ASAR-SkipLogin] Bootstrapped headless IDE credentials using healthy pool account: {}",
+                email
+            );
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                "[ASAR-SkipLogin] Headless credential bootstrap warning for {}: {}",
+                email,
+                e
+            );
+        }
+        Err(e) => {
+            tracing::warn!("[ASAR-SkipLogin] Headless bootstrap task panicked: {}", e);
+        }
+    }
+}
+
+#[tauri::command]
 pub async fn reset_asar_slots(
     proxy_state: State<'_, crate::commands::proxy::ProxyServiceState>,
 ) -> Result<AsarTelemetrySnapshot, String> {
@@ -268,6 +467,7 @@ pub async fn refresh_ide_models(
         .map_err(|e| format!("Task panicked: {}", e))?;
 
     let status = crate::commands::proxy::ensure_asar_bridge_started(target_port, &state).await?;
+    bootstrap_asar_ide_credentials_if_needed().await;
 
     let synced = tokio::task::spawn_blocking(asar_model_catalog::sync_models_from_accounts)
         .await

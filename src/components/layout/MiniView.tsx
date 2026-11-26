@@ -26,6 +26,7 @@ import {
     setAsarCrossFamilyFallback,
     setAsarDualTrack,
     setAsarEquivalentFallback,
+    setAsarSkipIdeLogin,
     startAsarBridge,
     stopAsarBridge,
     toggleAsarHeartbeat,
@@ -368,6 +369,20 @@ export default function MiniView() {
             setAsarTelemetry(snap);
         } catch (e) {
             console.error('Failed to toggle cross-family fallback:', e);
+        } finally {
+            setAsarBusy(null);
+        }
+    };
+
+    const handleMiniToggleSkipIdeLogin = async () => {
+        if (asarBusy) return;
+        setAsarBusy('skip_login');
+        try {
+            const next = !(asarTelemetry?.skip_ide_login_when_asar !== false);
+            const snap = await setAsarSkipIdeLogin(next);
+            setAsarTelemetry(snap);
+        } catch (e) {
+            console.error('Failed to toggle skip IDE login:', e);
         } finally {
             setAsarBusy(null);
         }
@@ -1225,7 +1240,7 @@ export default function MiniView() {
                                 </div>
                             )}
                             <div className="pt-1.5 border-t border-emerald-500/15 flex flex-wrap items-center justify-between gap-1.5 text-[10px]">
-                                <div className="flex items-center gap-1 shrink-0">
+                                <div className="flex flex-wrap items-center gap-1 min-w-0">
                                     <button
                                         type="button"
                                         disabled={asarBusy !== null}
@@ -1255,6 +1270,21 @@ export default function MiniView() {
                                     >
                                         <span>🔀 Cứu hộ chéo</span>
                                         <span>{(asarTelemetry?.cross_family_fallback_enabled !== false) ? '● ON' : '○ OFF'}</span>
+                                    </button>
+                                    <button
+                                        type="button"
+                                        disabled={asarBusy !== null}
+                                        onClick={handleMiniToggleSkipIdeLogin}
+                                        className={clsx(
+                                            "flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition-colors cursor-pointer shrink-0",
+                                            (asarTelemetry?.skip_ide_login_when_asar !== false)
+                                                ? "bg-emerald-50/80 dark:bg-emerald-950/30 border-emerald-300/70 dark:border-emerald-700/50 text-emerald-700 dark:text-emerald-300"
+                                                : "bg-black/[0.02] dark:bg-white/[0.04] border-black/[0.05] dark:border-white/[0.08] text-gray-500 dark:text-gray-400"
+                                        )}
+                                        title="Tự động nạp tài khoản khỏe & giả lập phiên hợp lệ qua :8989 để Antigravity không văng ra trang đăng nhập Google khi đang bật ASAR."
+                                    >
+                                        <span>🔓 Bỏ qua đăng nhập IDE (ASAR)</span>
+                                        <span>{(asarTelemetry?.skip_ide_login_when_asar !== false) ? '● ON' : '○ OFF'}</span>
                                     </button>
                                 </div>
                                 {(asarTelemetry?.fallback_downgrade_count ?? 0) > 0 && (

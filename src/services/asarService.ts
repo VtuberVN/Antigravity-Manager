@@ -1,5 +1,15 @@
 import { request as invoke } from '../utils/request';
 
+export interface AsarFileDetail {
+    path: string;
+    size_bytes: number;
+    sha256_short: string;
+    original_sha256_short?: string | null;
+    is_patched: boolean;
+    patch_method?: string | null;
+    patch_offset?: number | null;
+}
+
 export interface AsarStatus {
     is_patched: boolean;
     heartbeat_active: boolean;
@@ -7,6 +17,8 @@ export interface AsarStatus {
     asar_paths: string[];
     backup_paths: string[];
     patched_count: number;
+    terminate_processes?: boolean;
+    file_details?: AsarFileDetail[];
 }
 
 export interface PatchResult {
@@ -62,6 +74,10 @@ export async function toggleAsarHeartbeat(active: boolean, hotSwitch?: boolean):
 
 export async function setAsarBridgePort(port: number): Promise<number> {
     return await invoke<number>('set_asar_bridge_port', { port });
+}
+
+export async function setAsarTerminateProcesses(enabled: boolean): Promise<boolean> {
+    return await invoke<boolean>('set_asar_terminate_processes', { enabled });
 }
 
 export async function getAsarBridgeStatus(): Promise<AsarBridgeStatus> {
@@ -148,6 +164,7 @@ export interface AsarTelemetrySnapshot {
     last_fallback_route?: string | null;
     active_slots?: AsarActiveSlot[];
     separate_lite_slot?: boolean;
+    skip_ide_login_when_asar?: boolean;
     in_flight_streams?: AsarInFlightStream[];
 }
 
@@ -181,6 +198,10 @@ export async function setAsarCrossFamilyFallback(enabled: boolean): Promise<Asar
 
 export async function setAsarSeparateLiteSlot(enabled: boolean): Promise<AsarTelemetrySnapshot> {
     return await invoke<AsarTelemetrySnapshot>('set_asar_separate_lite_slot', { enabled });
+}
+
+export async function setAsarSkipIdeLogin(enabled: boolean): Promise<AsarTelemetrySnapshot> {
+    return await invoke<AsarTelemetrySnapshot>('set_asar_skip_ide_login', { enabled });
 }
 
 export async function refreshIdeModels(): Promise<string> {
